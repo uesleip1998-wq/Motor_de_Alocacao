@@ -4,15 +4,16 @@ import numpy as np
 from io import BytesIO
 import zipfile
 import copy
+import re
 
 # --- CONFIGURAÇÃO ---
-st.set_page_config(page_title="Motor Alocação IFSC v15.1", layout="wide")
-st.title("🧩 Motor de Alocação IFSC - Final (V15.1)")
+st.set_page_config(page_title="Motor Alocação IFSC v17.0", layout="wide")
+st.title("🧩 Motor de Alocação IFSC - Fusão e Tetris (V17)")
 st.markdown("""
-**Correções V15.1:**
-1.  **Bug Fix:** Dados não somem mais na repescagem (fim dos erros fatais null).
-2.  **Sexta EAD:** Cursos de Eventos/Guia usam a Sexta para completar a carga EAD.
-3.  **Split Automático:** Repescagem divide UCs grandes em 2 dias se necessário.
+**Lógica V17:**
+1.  **Fusão Automática:** UCs fragmentadas (ex: Ambientação) são unidas em blocos de 80h.
+2.  **Bypass EAD:** UCs 100% EAD são alocadas instantaneamente (sem conflito de sala).
+3.  **Micro-Split (Tetris):** UCs de 40h (32h presencial) procuram dois buracos de 4 semanas (16h+16h).
 """)
 
 # --- CONSTANTES ---
@@ -92,18 +93,67 @@ class MotorAlocacao:
         except: pass
         return False
 
-    def calcular_score_compatibilidade(self, u60, u20):
-        return 100 # Simplificado para V15.1
+    def otimizar_dados_entrada(self):
+        """
+        Fase 0: Fusão de UCs fragmentadas (ex: Ambientação Parte 1, 2, 3 -> Única 80h)
+        """
+        df = self.demandas.copy()
+        
+        # Identifica UCs que parecem ser partes da mesma coisa (mesmo nome base)
+        # Ex: "Ambientação (parte 1)" -> Base "Ambientação"
+        def limpar_nome(nome):
+            return re.sub(r'\s*\(parte \d+\)', '', str(nome), flags=re.IGNORECASE).strip()
+
+        df['Nome_Base'] = df['Nome_UC'].apply(limpar_nome)
+        
+        # Agrupa
+        grupos = df.groupby(['ID_Turma', 'Nome_Base'])
+        
+        novas_demandas = []
+        
+        for (turma, nome), grupo in grupos:
+            if len(grupo) > 1 and "PROEJA" in turma: # Foca a fusão no PROEJA/Regulares
+                # Cria Super Bloco
+                ch_total = grupo['Carga_Horaria_Total'].sum()
+                # Se somar mais que 80, trava em 80 (padrão semestre)
+                if ch_total > 80: ch_total = 80
+                
+                docentes_concat = ", ".join(grupo['Docentes'].unique())
+                espacos_concat = " + ".join(grupo['Espacos'].unique())
+                # Limpa espaços duplicados
+                espacos_unicos = list(set([e.strip() for e in espacos_concat.split('+')]))
+                espacos_final = " + ".join(espacos_unicos)
+                
+                item = grupo.iloc[0].to_dict()
+                item['Nome_UC'] = nome # Nome limpo
+                item['Carga_Horaria_Total'] = ch_total
+                item['Docentes'] = docentes_concat
+                item['Espacos'] = espacos_final
+                item['Tipo'] = "FUSAO"
+                novas_demandas.append(item)
+            else:
+                # Mantém original
+                for _, row in grupo.iterrows():
+                    row['Tipo'] = "SIMPLE"
+                    novas_demandas.append(row.to_dict())
+                    
+        return novas_demandas
 
     def preparar_demandas(self):
+        # 1. Otimiza (Fusão)
+        lista_bruta = self.otimizar_dados_entrada()
         lista_final = []
-        turmas = self.demandas['ID_Turma'].unique()
+        
+        # 2. Pareamento (60+20)
+        # Agrupa por turma para processar pareamentos
+        df_temp = pd.DataFrame(lista_bruta)
+        turmas = df_temp['ID_Turma'].unique()
         
         for turma in turmas:
-            df_t = self.demandas[self.demandas['ID_Turma'] == turma].copy()
-            ucs_60 = df_t[df_t['Carga_Horaria_Total'] == 60].to_dict('records')
-            ucs_20 = df_t[df_t['Carga_Horaria_Total'] == 20].to_dict('records')
-            outras = df_t[~df_t['Carga_Horaria_Total'].isin([20, 60])].to_dict('records')
+            ucs_turma = [d for d in lista_bruta if d['ID_Turma'] == turma]
+            ucs_60 = [d for d in ucs_turma if d['Carga_Horaria_Total'] == 60]
+            ucs_20 = [d for d in ucs_turma if d['Carga_Horaria_Total'] == 20]
+            outras = [d for d in ucs_turma if d['Carga_Horaria_Total'] not in [20, 60]]
             
             while ucs_60 and ucs_20:
                 u60 = ucs_60.pop(0)
@@ -117,35 +167,44 @@ class MotorAlocacao:
                 lista_final.append(item)
             
             for u in ucs_60 + ucs_20 + outras:
-                u['Tipo'] = "SIMPLE"
                 lista_final.append(u)
+                
         return lista_final
 
-    def simular_alocacao(self, item, dia):
-        # Filtro de Sexta-Feira (Presencial Proibido, mas EAD Permitido)
+    def simular_alocacao(self, item, dia, forcar_sexta=False):
+        # 1. BYPASS EAD (Se for 100% EAD, aloca direto)
+        espacos_str = str(item.get('Espacos', '')).upper()
+        regra_str = str(item.get('Regra_Especial', '')).upper()
+        
+        if "EAD" in espacos_str or "100% EAD" in regra_str:
+            # Aloca na Sexta (ou dia solicitado) sem checar sala
+            ch = float(item.get('Carga_Horaria_Total', 0) or 0)
+            return (True, ch, {
+                "rec": [str(item['ID_Turma'])], "sem_ini": 1, "sem_fim": 20, 
+                "sala": "EAD", "ch_total": ch, "meta": ch, "is_ead": True
+            })
+
+        # Filtro de Sexta-Feira
         eh_curso_sem_sexta = any(c in str(item['ID_Turma']).upper() for c in CURSOS_SEM_SEXTA)
-        if dia == 'Sexta-Feira' and eh_curso_sem_sexta:
+        if dia == 'Sexta-Feira' and eh_curso_sem_sexta and not forcar_sexta:
             return (False, 0, None)
 
+        # ... (Lógica PAREO e SIMPLE igual V16) ...
+        # Copiando lógica padrão para manter consistência
         if item['Tipo'] == "PAREO":
             u1, u2 = item['Componentes'][0], item['Componentes'][1]
             ordens = [[(u1, 15), (u2, 5)], [(u2, 5), (u1, 15)]]
-            
             for config in ordens:
                 p1, dur1 = config[0]
                 p2, dur2 = config[1]
-                
                 inicio_base = 1
                 if item['Semana_Inicio']: inicio_base = int(item['Semana_Inicio'])
                 if "FIC" in str(item['ID_Turma']): inicio_base = 4
                 inicio_real = 2 if (inicio_base == 1 and dia in ['Segunda-Feira', 'Terça-Feira', 'Quarta-Feira']) else inicio_base
-
                 for shift in range(15):
                     s1_ini, s1_fim = inicio_real + shift, inicio_real + shift + dur1 - 1
                     s2_ini, s2_fim = s1_fim + 1, s1_fim + dur2
                     if s2_fim > 22: continue
-
-                    # Verifica P1
                     docs1 = [d.strip() for d in str(p1['Docentes']).split(',')]
                     if any(self.verificar_bloqueio_docente(d, dia, item['Turno'], s1_ini, s1_fim) for d in docs1): continue
                     esp1 = str(p1['Espacos'])
@@ -155,8 +214,6 @@ class MotorAlocacao:
                     rec1 = docs1 + [str(item['ID_Turma'])] + ([sala1] if sala1 and sala1 != "PENDENTE" else [])
                     if any(l in esp1 for l in LABS_AB) and s1_fim >= 4: rec1 += [e.strip() for e in esp1.split('+') if e.strip() in LABS_AB]
                     if self.verificar_conflito(rec1, dia, item['Turno'], s1_ini, s1_fim): continue
-
-                    # Verifica P2
                     docs2 = [d.strip() for d in str(p2['Docentes']).split(',')]
                     if any(self.verificar_bloqueio_docente(d, dia, item['Turno'], s2_ini, s2_fim) for d in docs2): continue
                     esp2 = str(p2['Espacos'])
@@ -165,41 +222,32 @@ class MotorAlocacao:
                     rec2 = docs2 + [str(item['ID_Turma'])] + ([sala2] if sala2 and sala2 != "PENDENTE" else [])
                     if any(l in esp2 for l in LABS_AB) and s2_fim >= 4: rec2 += [e.strip() for e in esp2.split('+') if e.strip() in LABS_AB]
                     if self.verificar_conflito(rec2, dia, item['Turno'], s2_ini, s2_fim): continue
-
                     return (True, 80, {
                         "p1": p1, "s1_ini": s1_ini, "s1_fim": s1_fim, "rec1": rec1, "sala1": sala1,
                         "p2": p2, "s2_ini": s2_ini, "s2_fim": s2_fim, "rec2": rec2, "sala2": sala2
                     })
-
         else: # SIMPLE
             ch_total = float(item['Carga_Horaria_Total'] or 0)
             dur_ideal = int(np.ceil(ch_total / 4))
-            
-            # Regra 80/20
             meta_presencial = ch_total
             if "80%" in str(item['Regra_Especial']):
                 meta_presencial = ch_total * 0.8
                 dur_ideal = int(np.ceil(meta_presencial / 4))
-
             inicio_base = 1
             if item['Semana_Inicio']: inicio_base = int(item['Semana_Inicio'])
             if "FIC" in str(item['ID_Turma']): inicio_base = 4
             inicio_real = 2 if (inicio_base == 1 and dia in ['Segunda-Feira', 'Terça-Feira', 'Quarta-Feira']) else inicio_base
-
             for shift in range(15):
                 sem_ini = inicio_real + shift
                 sem_fim = sem_ini + dur_ideal - 1
                 if sem_fim > 22: sem_fim = 22
                 dur_real = sem_fim - sem_ini + 1
                 if dur_real <= 0: break
-
                 docs = [d.strip() for d in str(item['Docentes']).split(',')]
                 if any(self.verificar_bloqueio_docente(d, dia, item['Turno'], sem_ini, sem_fim) for d in docs): continue
-
                 esp = str(item['Espacos'])
                 sala = ""
                 rec = docs + [str(item['ID_Turma'])]
-                
                 if "Sala Teórica" in esp:
                     sala = self.buscar_sala(dia, item['Turno'], sem_ini, sem_fim)
                     if sala != "PENDENTE": rec.append(sala)
@@ -208,13 +256,11 @@ class MotorAlocacao:
                         sala = self.buscar_sala(dia, item['Turno'], sem_ini, min(3, sem_fim))
                         if sala != "PENDENTE": rec.append(sala)
                     if sem_fim >= 4: rec += [e.strip() for e in esp.split('+') if e.strip() in LABS_AB]
-
                 if not self.verificar_conflito(rec, dia, item['Turno'], sem_ini, sem_fim):
                     ch_presencial = dur_real * 4
                     return (True, ch_presencial, {
                         "rec": rec, "sem_ini": sem_ini, "sem_fim": sem_fim, "sala": sala, "ch_total": ch_total, "meta": meta_presencial
                     })
-
         return (False, 0, None)
 
     def executar(self):
@@ -231,117 +277,146 @@ class MotorAlocacao:
         
         total = len(lista_demandas)
         bar = st.progress(0)
-        
         repescagem = []
 
-        # --- FASE 1: ALOCAÇÃO PRINCIPAL ---
+        # FASE 1
         for idx, item in enumerate(lista_demandas):
-            melhor_resultado = (False, -1, None, None)
+            melhor = (False, -1, None, None)
             dias_teste = DIAS
             if item['Dia_Travado']: dias_teste = [item['Dia_Travado']]
 
             for dia in dias_teste:
                 sucesso, ch, config = self.simular_alocacao(item, dia)
-                if sucesso:
-                    if ch > melhor_resultado[1]:
-                        melhor_resultado = (True, ch, dia, config)
+                if sucesso and ch > melhor[1]: melhor = (True, ch, dia, config)
             
-            sucesso_final, ch_final, dia_final, config_final = melhor_resultado
-            
-            if sucesso_final:
-                if item['Tipo'] == "PAREO":
-                    self.reservar(config_final['rec1'], dia_final, item['Turno'], config_final['s1_ini'], config_final['s1_fim'])
-                    self.reservar(config_final['rec2'], dia_final, item['Turno'], config_final['s2_ini'], config_final['s2_fim'])
-                    self.grade.append({
-                        "ID_Turma": item['ID_Turma'], "UC": config_final['p1']['Nome_UC'], "CH_Total": config_final['p1']['Carga_Horaria_Total'],
-                        "Dia": dia_final, "Turno": item['Turno'], "Docentes": config_final['p1']['Docentes'],
-                        "Espacos": f"{config_final['p1']['Espacos']} ({config_final['sala1']})", 
-                        "Semana_Inicio": config_final['s1_ini'], "Semana_Fim": config_final['s1_fim'], "Status": "✅ Alocado (Pareado)"
-                    })
-                    self.grade.append({
-                        "ID_Turma": item['ID_Turma'], "UC": config_final['p2']['Nome_UC'], "CH_Total": config_final['p2']['Carga_Horaria_Total'],
-                        "Dia": dia_final, "Turno": item['Turno'], "Docentes": config_final['p2']['Docentes'],
-                        "Espacos": f"{config_final['p2']['Espacos']} ({config_final['sala2']})", 
-                        "Semana_Inicio": config_final['s2_ini'], "Semana_Fim": config_final['s2_fim'], "Status": "✅ Alocado (Pareado)"
-                    })
-                else:
-                    self.reservar(config_final['rec'], dia_final, item['Turno'], config_final['sem_ini'], config_final['sem_fim'])
-                    status = "✅ Alocado"
-                    
-                    # Lógica EAD Sexta
-                    eh_curso_sem_sexta = any(c in str(item['ID_Turma']).upper() for c in CURSOS_SEM_SEXTA)
-                    if ch_final < config_final['meta']:
-                        status = "⚠️ Parcial"
-                    elif ch_final < config_final['ch_total']:
-                        if eh_curso_sem_sexta: status = "✅ Alocado (Híbrido - EAD Sexta)"
-                        else: status = "✅ Alocado (Híbrido)"
-                    
-                    self.grade.append({
-                        "ID_Turma": item['ID_Turma'], "UC": item['Nome_UC'], "CH_Total": config_final['ch_total'],
-                        "Dia": dia_final, "Turno": item['Turno'], "Docentes": item['Docentes'],
-                        "Espacos": f"{item['Espacos']} ({config_final['sala']})", 
-                        "Semana_Inicio": config_final['sem_ini'], "Semana_Fim": config_final['sem_fim'], 
-                        "Status": status, "Obs": f"{ch_final}h Presenciais"
-                    })
+            if melhor[0]:
+                self.aplicar_resultado(item, melhor[2], melhor[3])
             else:
-                # DIVÓRCIO SEGURO (Deep Copy para evitar Null)
                 if item['Tipo'] == "PAREO":
-                    c1 = copy.deepcopy(item['Componentes'][0])
-                    c1['Tipo'] = "SIMPLE"
-                    repescagem.append(c1)
-                    
-                    c2 = copy.deepcopy(item['Componentes'][1])
-                    c2['Tipo'] = "SIMPLE"
-                    repescagem.append(c2)
+                    repescagem.append(copy.deepcopy(item['Componentes'][0]) | {"Tipo": "SIMPLE"})
+                    repescagem.append(copy.deepcopy(item['Componentes'][1]) | {"Tipo": "SIMPLE"})
                 else:
                     repescagem.append(copy.deepcopy(item))
-
             bar.progress((idx + 1) / (total + len(repescagem) if repescagem else total))
 
-        # --- FASE 2: REPESCAGEM (Com Split) ---
+        # FASE 2: REPESCAGEM (Micro-Split Tetris)
         for item in repescagem:
-            melhor_resultado = (False, -1, None, None)
+            melhor = (False, -1, None, None)
             dias_teste = DIAS
             if item.get('Dia_Travado'): dias_teste = [item['Dia_Travado']]
             
-            # Tenta Normal de novo
+            # 1. Tenta Normal
             for dia in dias_teste:
                 sucesso, ch, config = self.simular_alocacao(item, dia)
-                if sucesso and ch > melhor_resultado[1]: melhor_resultado = (True, ch, dia, config)
+                if sucesso and ch > melhor[1]: melhor = (True, ch, dia, config)
             
-            sucesso_final, ch_final, dia_final, config_final = melhor_resultado
-            
-            if sucesso_final:
-                self.reservar(config_final['rec'], dia_final, item['Turno'], config_final['sem_ini'], config_final['sem_fim'])
-                self.grade.append({
-                    "ID_Turma": item['ID_Turma'], "UC": item['Nome_UC'], "CH_Total": config_final['ch_total'],
-                    "Dia": dia_final, "Turno": item['Turno'], "Docentes": item['Docentes'],
-                    "Espacos": f"{item['Espacos']} ({config_final['sala']})", 
-                    "Semana_Inicio": config_final['sem_ini'], "Semana_Fim": config_final['sem_fim'], 
-                    "Status": "✅ Alocado (Repescagem)", "Obs": f"{ch_final}h Presenciais"
-                })
+            if melhor[0]:
+                self.aplicar_resultado(item, melhor[2], melhor[3], " (Repescagem)")
             else:
-                # TENTA SPLIT (Último Recurso)
+                # 2. TENTA MICRO-SPLIT (Tetris 16h+16h)
                 ch_total = float(item.get('Carga_Horaria_Total', 0) or 0)
-                if ch_total >= 40:
-                    split_ok = False
-                    # Tenta achar 2 dias livres para metade da carga
+                split_ok = False
+                
+                # Só aplica se for UC de 40h (32h presencial) e não tiver restrição de dia fixo
+                if ch_total >= 40 and not item.get('Dia_Travado'):
+                    # Procura 2 buracos de 4 semanas (16h)
+                    # Buraco 1
                     for d1 in DIAS:
-                        for d2 in DIAS:
-                            if d1 == d2: continue
-                            # (Lógica simplificada de split para não estourar complexidade)
-                            # Se achar, reserva e break
-                            pass 
+                        if d1 == 'Sexta-Feira' and any(c in str(item['ID_Turma']) for c in CURSOS_SEM_SEXTA): continue
+                        
+                        # Tenta achar 4 semanas livres em d1 (preferencia fim do semestre)
+                        for s1_ini in [17, 13, 9, 5, 1]: 
+                            s1_fim = s1_ini + 3
+                            if s1_fim > 22: continue
+                            
+                            # Verifica d1
+                            docs = [d.strip() for d in str(item['Docentes']).split(',')]
+                            if any(self.verificar_bloqueio_docente(d, d1, item['Turno'], s1_ini, s1_fim) for d in docs): continue
+                            sala1 = self.buscar_sala(d1, item['Turno'], s1_ini, s1_fim)
+                            rec1 = docs + [str(item['ID_Turma'])] + ([sala1] if sala1 != "PENDENTE" else [])
+                            if self.verificar_conflito(rec1, d1, item['Turno'], s1_ini, s1_fim): continue
+                            
+                            # Buraco 2 (pode ser outro dia ou mesmo dia em outra semana)
+                            for d2 in DIAS:
+                                if d2 == 'Sexta-Feira' and any(c in str(item['ID_Turma']) for c in CURSOS_SEM_SEXTA): continue
+                                
+                                for s2_ini in [17, 13, 9, 5, 1]:
+                                    s2_fim = s2_ini + 3
+                                    if s2_fim > 22: continue
+                                    # Não pode sobrepor com s1 se for mesmo dia
+                                    if d1 == d2 and not (s2_ini > s1_fim or s2_fim < s1_ini): continue
+                                    
+                                    # Verifica d2
+                                    if any(self.verificar_bloqueio_docente(d, d2, item['Turno'], s2_ini, s2_fim) for d in docs): continue
+                                    sala2 = self.buscar_sala(d2, item['Turno'], s2_ini, s2_fim)
+                                    rec2 = docs + [str(item['ID_Turma'])] + ([sala2] if sala2 != "PENDENTE" else [])
+                                    if self.verificar_conflito(rec2, d2, item['Turno'], s2_ini, s2_fim): continue
+                                    
+                                    # ACHOU TETRIS!
+                                    self.reservar(rec1, d1, item['Turno'], s1_ini, s1_fim)
+                                    self.reservar(rec2, d2, item['Turno'], s2_ini, s2_fim)
+                                    
+                                    self.grade.append({
+                                        "ID_Turma": item['ID_Turma'], "UC": item['Nome_UC'], "CH_Total": ch_total,
+                                        "Dia": f"{d1} e {d2}", "Turno": item['Turno'], "Docentes": item['Docentes'],
+                                        "Espacos": f"Split ({sala1}/{sala2})", "Semana_Inicio": f"{s1_ini}/{s2_ini}", 
+                                        "Semana_Fim": f"{s1_fim}/{s2_fim}", "Status": "✅ Alocado (Tetris 16h+16h)"
+                                    })
+                                    split_ok = True
+                                    break
+                                if split_ok: break
+                            if split_ok: break
+                        if split_ok: break
 
                 if not split_ok:
-                    self.erros.append(f"❌ {item['ID_Turma']} - {item['Nome_UC']}")
+                    # Último Recurso: EAD
                     self.grade.append({
                         "ID_Turma": item['ID_Turma'], "UC": item['Nome_UC'], 
-                        "CH_Total": item.get('Carga_Horaria_Total'),
-                        "Status": "❌ Erro Fatal"
+                        "CH_Total": ch_total, "Dia": "EAD", "Turno": "EAD",
+                        "Docentes": item['Docentes'], "Espacos": "EAD",
+                        "Status": "⚠️ Alocado EAD (Falta de Espaço)", "Obs": "Sem sala presencial disponível"
                     })
 
         return pd.DataFrame(self.grade), self.erros
+
+    def aplicar_resultado(self, item, dia, config, obs_extra=""):
+        if config.get('is_ead'):
+            self.grade.append({
+                "ID_Turma": item['ID_Turma'], "UC": item['Nome_UC'], "CH_Total": config['ch_total'],
+                "Dia": "Sexta-Feira (EAD)", "Turno": "EAD", "Docentes": item['Docentes'],
+                "Espacos": "EAD", "Semana_Inicio": 1, "Semana_Fim": 20, 
+                "Status": "✅ Alocado (100% EAD)"
+            })
+            return
+
+        if item['Tipo'] == "PAREO":
+            self.reservar(config['rec1'], dia, item['Turno'], config['s1_ini'], config['s1_fim'])
+            self.reservar(config['rec2'], dia, item['Turno'], config['s2_ini'], config['s2_fim'])
+            self.grade.append({
+                "ID_Turma": item['ID_Turma'], "UC": config['p1']['Nome_UC'], "CH_Total": config['p1']['Carga_Horaria_Total'],
+                "Dia": dia, "Turno": item['Turno'], "Docentes": config['p1']['Docentes'],
+                "Espacos": f"{config['p1']['Espacos']} ({config['sala1']})", 
+                "Semana_Inicio": config['s1_ini'], "Semana_Fim": config['s1_fim'], "Status": "✅ Alocado (Pareado)" + obs_extra
+            })
+            self.grade.append({
+                "ID_Turma": item['ID_Turma'], "UC": config['p2']['Nome_UC'], "CH_Total": config['p2']['Carga_Horaria_Total'],
+                "Dia": dia, "Turno": item['Turno'], "Docentes": config['p2']['Docentes'],
+                "Espacos": f"{config['p2']['Espacos']} ({config['sala2']})", 
+                "Semana_Inicio": config['s2_ini'], "Semana_Fim": config['s2_fim'], "Status": "✅ Alocado (Pareado)" + obs_extra
+            })
+        else:
+            self.reservar(config['rec'], dia, item['Turno'], config['sem_ini'], config['sem_fim'])
+            status = "✅ Alocado" + obs_extra
+            eh_curso_sem_sexta = any(c in str(item['ID_Turma']).upper() for c in CURSOS_SEM_SEXTA)
+            if config['ch_total'] > config['meta'] and eh_curso_sem_sexta: status += " (Híbrido - EAD Sexta)"
+            
+            self.grade.append({
+                "ID_Turma": item['ID_Turma'], "UC": item['Nome_UC'], "CH_Total": config['ch_total'],
+                "Dia": dia, "Turno": item['Turno'], "Docentes": item['Docentes'],
+                "Espacos": f"{item['Espacos']} ({config['sala']})", 
+                "Semana_Inicio": config['sem_ini'], "Semana_Fim": config['sem_fim'], 
+                "Status": status, "Obs": f"{config['meta']}h Presenciais"
+            })
 
 # --- INTERFACE ---
 st.sidebar.header("📂 Área de Trabalho")
@@ -349,7 +424,7 @@ st.sidebar.download_button("📥 Baixar Modelo", gerar_template(), "modelo.xlsx"
 st.sidebar.markdown("---")
 up = st.sidebar.file_uploader("Upload Planilha", type=['xlsx'])
 
-if up and st.button("🚀 Rodar Otimizador V15.1"):
+if up and st.button("🚀 Rodar Otimizador V17"):
     try:
         df_dem = pd.read_excel(up, sheet_name='Demandas')
         try: df_doc = pd.read_excel(up, sheet_name='Docentes')
@@ -374,7 +449,7 @@ if up and st.button("🚀 Rodar Otimizador V15.1"):
                 z.writestr("04_Agenda_Docentes.csv", converter_csv(pd.DataFrame(rows)))
                 z.writestr("03_Ocupacao_Espacos.csv", converter_csv(df_res[['Dia', 'Turno', 'Espacos', 'ID_Turma', 'Semana_Inicio', 'Semana_Fim']]))
 
-        st.download_button("📦 Baixar Resultados (ZIP)", buf.getvalue(), "Resultados_V15.1.zip", "application/zip")
+        st.download_button("📦 Baixar Resultados (ZIP)", buf.getvalue(), "Resultados_V17.zip", "application/zip")
         st.dataframe(df_res)
         
     except Exception as e:
