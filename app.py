@@ -5,8 +5,8 @@ from io import BytesIO
 import zipfile
 
 # --- CONFIGURAÇÃO ---
-st.set_page_config(page_title="Motor Alocação IFSC v14.0", layout="wide")
-st.title("🧩 Motor de Alocação IFSC - Matriz Binária (V14)")
+st.set_page_config(page_title="Motor Alocação IFSC v14.1", layout="wide")
+st.title("🧩 Motor de Alocação IFSC - Matriz Binária (V14.1)")
 st.markdown("""
 **Arquitetura V14:**
 1.  **Matriz de Ocupação:** Garante integridade matemática (zero sobreposição).
@@ -105,7 +105,8 @@ class MotorAlocacao:
         except: pass
         return False
 
-    def processar_ondas(self):
+    # --- FUNÇÃO PRINCIPAL CORRIGIDA ---
+    def executar(self):
         # PREPARAÇÃO DOS DADOS
         lista_demandas = []
         
@@ -300,7 +301,6 @@ class MotorAlocacao:
                             # TENTATIVA SPLIT (Se falhou normal e é UC de 40h)
                             elif ch_total == 40 and not sucesso:
                                 # Procura 2 dias com 5 semanas cada (20h + 20h = 40h)
-                                # Simplificação V14: Tenta achar outro dia livre no mesmo turno
                                 for dia2 in [d for d in DIAS if d != dia]:
                                     # Verifica se dia2 está livre para SEM 1-5
                                     s_split_ini, s_split_fim = sem_ini, sem_ini + 4
@@ -341,7 +341,7 @@ st.sidebar.download_button("📥 Baixar Modelo", gerar_template(), "modelo.xlsx"
 st.sidebar.markdown("---")
 up = st.sidebar.file_uploader("Upload Planilha", type=['xlsx'])
 
-if up and st.button("🚀 Rodar Otimizador V14"):
+if up and st.button("🚀 Rodar Otimizador V14.1"):
     try:
         df_dem = pd.read_excel(up, sheet_name='Demandas')
         try: df_doc = pd.read_excel(up, sheet_name='Docentes')
