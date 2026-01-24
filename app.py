@@ -5,14 +5,14 @@ from io import BytesIO
 import zipfile
 
 # --- CONFIGURAÇÃO DA PÁGINA ---
-st.set_page_config(page_title="Motor Alocação IFSC v7.0", layout="wide")
+st.set_page_config(page_title="Motor Alocação IFSC v8.0", layout="wide")
 
-st.title("🧩 Motor de Alocação IFSC - Versão Gerencial (V7)")
+st.title("🧩 Motor de Alocação IFSC - Versão Flexível (V8)")
 st.markdown("""
-**Novidades da Versão 7.0:**
-1.  **Prioridade por Licença:** Professores com licença furam a fila e são alocados primeiro.
-2.  **Alocação Parcial:** Se não couber tudo, aloca o máximo possível e avisa o restante (EAD).
-3.  **Pacote de Relatórios:** Gera ZIP com 4 planilhas (Grade, Erros, Espaços, Docentes).
+**Melhorias da Versão 8.0:**
+1.  **Alocação Resiliente:** Se não couber toda a carga horária, aloca o que der e sugere EAD para o resto.
+2.  **Sala Teórica Virtual:** Se faltar sala nas semanas 1-3, usa "Sala A Definir" para não travar a grade.
+3.  **Diagnóstico de Falha:** O relatório de erros agora diz EXATAMENTE o que faltou (Docente, Sala ou Calendário).
 """)
 
 # --- 1. DADOS DE CONTEXTO ---
@@ -50,18 +50,11 @@ class MotorAlocacao:
         self.ocupacao = {} 
 
     def verificar_restricao_docente(self, docente, sem_ini, sem_fim):
-        """Verifica se o docente tem licença no período solicitado"""
-        # Simplificação: Procura o nome do docente na aba de restrições
-        # Se encontrar licença que conflita com as semanas, retorna True (Tem restrição)
         try:
             regra = self.restricoes_docentes[self.restricoes_docentes['Nome_Docente'] == docente]
             if not regra.empty:
                 obs = str(regra.iloc[0]['Restricoes_Extras']).lower()
-                # Lógica básica de detecção de texto (pode ser refinada)
-                if "licença" in obs:
-                    # Aqui poderíamos fazer um parser complexo de datas, 
-                    # mas por enquanto vamos assumir que se tem licença, é crítico.
-                    return True
+                if "licença" in obs: return True
         except:
             pass
         return False
@@ -91,25 +84,19 @@ class MotorAlocacao:
             conflitos = self.verificar_disponibilidade([sala], dia, turno, sem_ini, sem_fim)
             if not conflitos:
                 return sala
-        return "SEM_SALA_TEORICA"
+        # MUDANÇA V8: Se não achar, retorna uma sala virtual para não travar
+        return "Sala Teórica (A Definir)"
 
     def executar(self):
         dias_uteis = ['Segunda-Feira', 'Terça-Feira', 'Quarta-Feira', 'Quinta-Feira', 'Sexta-Feira']
         
-        # --- INTELIGÊNCIA V7: ORDENAÇÃO POR RISCO ---
-        # Calcula prioridade:
-        # Nível 1 (Máximo): Docente com Licença ou Dia Travado
-        # Nível 2: Uso de Laboratório (Recurso Escasso)
-        # Nível 3: Normal
-        
+        # Prioridade Inteligente
         def calcular_prioridade(row):
             docentes = [d.strip() for d in str(row['Docentes']).split(',')]
             tem_licenca = any(self.verificar_restricao_docente(d, 1, 22) for d in docentes)
             dia_travado = bool(row['Dia_Travado'])
-            usa_lab = any(l in str(row['Espacos']) for l in LABS_AB)
-            
-            if tem_licenca or dia_travado: return 0 # Processa PRIMEIRO
-            if usa_lab: return 1
+            if tem_licenca: return 0
+            if dia_travado: return 1
             return 2
 
         self.demandas['Prioridade_Calc'] = self.demandas.apply(calcular_prioridade, axis=1)
@@ -121,7 +108,6 @@ class MotorAlocacao:
         for idx, row in demandas_ordenadas.iterrows():
             alocado = False
             
-            # Parsing
             docentes = [d.strip() for d in str(row['Docentes']).split(',') if d.strip()]
             espacos_originais = [e.strip() for e in str(row['Espacos']).split('+') if e.strip()]
             id_turma = str(row['ID_Turma']).strip()
@@ -132,22 +118,21 @@ class MotorAlocacao:
             
             dias_tentativa = [row['Dia_Travado']] if row['Dia_Travado'] else dias_uteis
 
-            melhor_alocacao = None # Para guardar alocação parcial se necessário
+            melhor_resultado_parcial = None
 
             for dia in dias_tentativa:
                 if alocado: break
 
-                # Ajuste Calendário
                 sem_ini_ajustado = sem_ini_base
                 if sem_ini_ajustado == 1 and dia in ['Segunda-Feira', 'Terça-Feira', 'Quarta-Feira']:
                     sem_ini_ajustado = 2
                 
                 # Tenta encaixar (Sliding Window)
-                for deslocamento in range(15): # Aumentei o range para tentar achar vaga longe
+                for deslocamento in range(15): 
                     sem_ini_teste = sem_ini_ajustado + deslocamento
                     sem_fim_teste = sem_ini_teste + duracao_semanas_ideal - 1
                     
-                    # Se passar do fim do semestre, trunca (Alocação Parcial)
+                    # Truncamento para fim do semestre (Alocação Parcial)
                     fim_semestre = 22
                     if sem_fim_teste > fim_semestre:
                         sem_fim_teste = fim_semestre
@@ -181,18 +166,18 @@ class MotorAlocacao:
                         conflitos_f2 = self.verificar_disponibilidade(recursos_fase_2, dia, row['Turno'], sem_ini_f2, sem_fim_teste)
 
                     if not conflitos_f1 and not conflitos_f2:
-                        # SUCESSO!
+                        # SUCESSO TOTAL OU PARCIAL
                         if recursos_fase_1: self.reservar_recursos(recursos_fase_1, dia, row['Turno'], sem_ini_teste, min(3, sem_fim_teste))
                         if recursos_fase_2 and sem_fim_teste >= sem_ini_f2: self.reservar_recursos(recursos_fase_2, dia, row['Turno'], sem_ini_f2, sem_fim_teste)
                         
-                        # Verifica se foi parcial
                         ch_alocada = duracao_real * 4
                         status = "✅ Alocado"
                         obs = ""
+                        
                         if ch_alocada < ch_total:
                             status = "⚠️ Parcial"
-                            obs = f"Faltam {ch_total - ch_alocada}h (Sugerido EAD)"
-                            self.log_erros.append(f"⚠️ {row['ID_Turma']} - {row['Nome_UC']}: Alocação Parcial. {obs}")
+                            obs = f"Alocado {ch_alocada}h. Faltam {ch_total - ch_alocada}h (EAD)"
+                            self.log_erros.append(f"⚠️ {row['ID_Turma']} - {row['Nome_UC']}: {obs}")
 
                         espaco_final = " + ".join(espacos_originais)
                         if recursos_fase_1:
@@ -207,13 +192,19 @@ class MotorAlocacao:
                         })
                         alocado = True
                         break 
+                    else:
+                        # Guarda o motivo da falha para o relatório
+                        todos_conflitos = list(set(conflitos_f1 + conflitos_f2))
+                        if not melhor_resultado_parcial:
+                            melhor_resultado_parcial = f"Conflito com: {', '.join(todos_conflitos)}"
                 
                 if alocado: break
 
             if not alocado:
-                self.log_erros.append(f"❌ {row['ID_Turma']} - {row['Nome_UC']}: Não foi possível alocar em nenhum dia.")
+                motivo = melhor_resultado_parcial if melhor_resultado_parcial else "Sem dias compatíveis"
+                self.log_erros.append(f"❌ {row['ID_Turma']} - {row['Nome_UC']}: {motivo}")
                 self.grade.append({
-                    "ID_Turma": row['ID_Turma'], "UC": row['Nome_UC'], "Status": "❌ Erro"
+                    "ID_Turma": row['ID_Turma'], "UC": row['Nome_UC'], "Status": "❌ Erro", "Obs": motivo
                 })
 
             progress_bar.progress((idx + 1) / total_items)
@@ -228,60 +219,51 @@ st.sidebar.markdown("---")
 uploaded_file = st.sidebar.file_uploader("Carregar Planilha", type=['xlsx'])
 
 if uploaded_file:
-    if st.button("🚀 Iniciar Alocação Gerencial"):
+    if st.button("🚀 Iniciar Alocação V8"):
         try:
-            # Lê as duas abas necessárias
             df_demandas = pd.read_excel(uploaded_file, sheet_name='Demandas')
             try:
                 df_docentes = pd.read_excel(uploaded_file, sheet_name='Docentes')
             except:
-                df_docentes = pd.DataFrame() # Cria vazio se não tiver
+                df_docentes = pd.DataFrame()
 
             motor = MotorAlocacao(df_demandas, df_docentes)
             df_grade, erros = motor.executar()
             
-            # --- GERAÇÃO DE RELATÓRIOS ---
             st.success("Processamento Concluído!")
             
-            # 1. Grade Geral
+            # Geração de Arquivos
             csv_grade = converter_df_para_csv(df_grade)
-            
-            # 2. Relatório de Erros
             df_erros = pd.DataFrame(erros, columns=["Mensagem"])
             csv_erros = converter_df_para_csv(df_erros)
             
-            # 3. Ocupação de Espaços (Pivot Table)
-            # Filtra apenas alocados
             df_ok = df_grade[df_grade['Status'].str.contains("Alocado|Parcial")].copy()
             if not df_ok.empty:
                 df_espacos = df_ok[['Dia', 'Turno', 'Espacos', 'ID_Turma', 'UC']].sort_values(['Dia', 'Turno', 'Espacos'])
                 csv_espacos = converter_df_para_csv(df_espacos)
                 
-                # 4. Agenda Docentes
                 df_docentes_report = df_ok[['Docentes', 'Dia', 'Turno', 'ID_Turma', 'UC']].sort_values(['Docentes', 'Dia'])
                 csv_docentes = converter_df_para_csv(df_docentes_report)
             else:
                 csv_espacos = b""
                 csv_docentes = b""
 
-            # --- CRIAÇÃO DO ZIP ---
             zip_buffer = BytesIO()
             with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
                 zip_file.writestr("01_Grade_Geral.csv", csv_grade)
-                zip_file.writestr("02_Relatorio_Erros.csv", csv_erros)
+                zip_file.writestr("02_Relatorio_Erros_Detelhado.csv", csv_erros)
                 if not df_ok.empty:
                     zip_file.writestr("03_Ocupacao_Espacos.csv", csv_espacos)
                     zip_file.writestr("04_Agenda_Docentes.csv", csv_docentes)
             
             st.download_button(
-                label="📦 Baixar Pacote Completo (ZIP)",
+                label="📦 Baixar Pacote ZIP (V8)",
                 data=zip_buffer.getvalue(),
-                file_name="Relatorios_Alocacao_IFSC.zip",
+                file_name="Relatorios_Alocacao_IFSC_V8.zip",
                 mime="application/zip"
             )
             
-            # Preview na tela
-            st.subheader("Visualização Rápida (Grade)")
+            st.subheader("Visualização (Grade)")
             st.dataframe(df_grade)
             
         except Exception as e:
