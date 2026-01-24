@@ -7,13 +7,13 @@ import copy
 import re
 
 # --- CONFIGURAÇÃO ---
-st.set_page_config(page_title="Motor Alocação IFSC v19.0", layout="wide")
-st.title("🧩 Motor de Alocação IFSC - Zoneamento (V19)")
+st.set_page_config(page_title="Motor Alocação IFSC v21.0", layout="wide")
+st.title("🧩 Motor de Alocação IFSC - Zoneamento VIP (V21)")
 st.markdown("""
-**Arquitetura em Camadas V19:**
-1.  **Zoneamento:** Define Sala Base fixa para cada turma regular.
-2.  **Regulares:** Aloca UCs usando Sala Base (Sem 1-3) + Lab (Sem 4+).
-3.  **FIC:** Preenche os buracos nas salas teóricas deixados pelos regulares.
+**Lógica V21:**
+1.  **Zoneamento VIP:** Apenas cursos estruturais ganham Sala Base Fixa.
+2.  **Idiomas Nômades:** Inglês/Espanhol entram nos buracos deixados pelos VIPs.
+3.  **Garantia Matemática:** Há salas suficientes para todos os VIPs simultaneamente.
 """)
 
 # --- CONSTANTES ---
@@ -25,6 +25,11 @@ LABS_AB = [
 ]
 SALAS_TEORICAS = [f"Sala {i}" for i in range(1, 13) if i != 6]
 SALAS_BACKUP = ["Lab. Informática 1", "Lab. Informática 2", "Restaurante 1"]
+
+# Palavras-chave que definem uma turma como "VIP" (Dona de Sala)
+KEYWORDS_VIP = ["PANIF", "CONF", "COZINHA", "GUIA", "EVENTOS", "PATRIMONIO"]
+# Palavras-chave que definem uma turma como "Nômade" (Idiomas)
+KEYWORDS_NOMADE = ["INGLÊS", "INGLES", "ESPANHOL", "LIBRAS", "CONVERSAÇÃO", "CONVERSACAO"]
 
 # --- FUNÇÕES AUXILIARES ---
 def gerar_template():
@@ -49,7 +54,7 @@ class MotorAlocacao:
         self.grade = []
         self.erros = []
         self.matriz = {} 
-        self.sala_base = {} # Mapa: Turma -> Sala Fixa
+        self.sala_base = {} 
 
     def normalizar(self, texto):
         return str(texto).strip().upper()
@@ -68,6 +73,25 @@ class MotorAlocacao:
             for sem in range(sem_ini, sem_fim + 1):
                 chave = f"{rec_norm}|{dia}|{turno}|{sem}"
                 self.matriz[chave] = True
+
+    def buscar_sala(self, turma, dia, turno, sem_ini, sem_fim, modo_nomade=False):
+        # 1. Se for VIP, tenta Sala Base
+        if not modo_nomade:
+            base = self.sala_base.get(turma)
+            if base and not self.verificar_conflito([base], dia, turno, sem_ini, sem_fim):
+                return base
+        
+        # 2. Se for Nômade (ou VIP sem base), tenta qualquer Teórica
+        for sala in SALAS_TEORICAS:
+            if not self.verificar_conflito([sala], dia, turno, sem_ini, sem_fim):
+                return sala
+                
+        # 3. Backups
+        for sala in SALAS_BACKUP:
+            if not self.verificar_conflito([sala], dia, turno, sem_ini, sem_fim):
+                return sala
+                
+        return None
 
     def verificar_bloqueio_docente(self, docente, dia, turno, sem_ini, sem_fim):
         try:
@@ -88,7 +112,6 @@ class MotorAlocacao:
         return False
 
     def otimizar_dados_entrada(self):
-        # Fusão de UCs fragmentadas
         df = self.demandas.copy()
         def limpar_nome(nome):
             return re.sub(r'\s*\(parte \d+\)', '', str(nome), flags=re.IGNORECASE).strip()
@@ -118,35 +141,57 @@ class MotorAlocacao:
 
     def definir_zoneamento(self):
         """
-        CAMADA 1: Atribui Sala Base para cada Turma Regular
+        CAMADA 1: Atribui Sala Base APENAS para Turmas VIP
         """
         turmas = self.demandas['ID_Turma'].unique()
-        turmas_regulares = [t for t in turmas if "FIC" not in str(t).upper()]
         
-        # Distribui salas sequencialmente
-        idx_sala = 0
-        for turma in turmas_regulares:
-            if idx_sala < len(SALAS_TEORICAS):
-                self.sala_base[turma] = SALAS_TEORICAS[idx_sala]
-                idx_sala += 1
+        # Filtro VIP Rigoroso
+        turmas_vip = []
+        for t in turmas:
+            t_upper = str(t).upper()
+            eh_vip = any(k in t_upper for k in KEYWORDS_VIP)
+            eh_nomade = any(k in t_upper for k in KEYWORDS_NOMADE)
+            if eh_vip and not eh_nomade:
+                turmas_vip.append(t)
+        
+        # Distribui salas sequencialmente para os VIPs
+        # Reinicia contagem de salas para cada turno para otimizar? 
+        # Não, melhor garantir sala exclusiva global para simplificar (temos salas suficientes)
+        # Ou melhor: Sala 1 é do Proeja Panif 1 (Noturno) E da Confeitaria 2 (Matutino).
+        
+        # Mapa: Turno -> Lista de Turmas VIP
+        vip_por_turno = {'Matutino': [], 'Vespertino': [], 'Noturno': []}
+        
+        # Tenta adivinhar o turno da turma (pega o turno da maioria das UCs)
+        for t in turmas_vip:
+            mode_turno = self.demandas[self.demandas['ID_Turma'] == t]['Turno'].mode()[0]
+            if mode_turno in vip_por_turno:
+                vip_por_turno[mode_turno].append(t)
             else:
-                # Se acabaram as salas teóricas, usa backup
-                idx_bkp = (idx_sala - len(SALAS_TEORICAS)) % len(SALAS_BACKUP)
-                self.sala_base[turma] = SALAS_BACKUP[idx_bkp]
-                idx_sala += 1
+                vip_por_turno['Noturno'].append(t) # Default
+
+        # Aloca Salas por Turno (Reutilizando salas em turnos diferentes)
+        for turno, lista_turmas in vip_por_turno.items():
+            idx_sala = 0
+            for turma in lista_turmas:
+                if idx_sala < len(SALAS_TEORICAS):
+                    self.sala_base[turma] = SALAS_TEORICAS[idx_sala]
+                    idx_sala += 1
+                else:
+                    idx_bkp = (idx_sala - len(SALAS_TEORICAS)) % len(SALAS_BACKUP)
+                    self.sala_base[turma] = SALAS_BACKUP[idx_bkp]
+                    idx_sala += 1
 
     def preparar_demandas(self):
         lista_bruta = self.otimizar_dados_entrada()
         lista_final = []
         df_temp = pd.DataFrame(lista_bruta)
         turmas = df_temp['ID_Turma'].unique()
-        
         for turma in turmas:
             ucs_turma = [d for d in lista_bruta if d['ID_Turma'] == turma]
             ucs_60 = [d for d in ucs_turma if d['Carga_Horaria_Total'] == 60]
             ucs_20 = [d for d in ucs_turma if d['Carga_Horaria_Total'] == 20]
             outras = [d for d in ucs_turma if d['Carga_Horaria_Total'] not in [20, 60]]
-            
             while ucs_60 and ucs_20:
                 u60 = ucs_60.pop(0)
                 u20 = ucs_20.pop(0)
@@ -161,7 +206,7 @@ class MotorAlocacao:
                 lista_final.append(u)
         return lista_final
 
-    def simular_alocacao(self, item, dia, forcar_sexta=False, modo_fic=False):
+    def simular_alocacao(self, item, dia, forcar_sexta=False, modo_nomade=False):
         # Bypass EAD
         espacos_str = str(item.get('Espacos', '')).upper()
         if "EAD" in espacos_str or "100% EAD" in str(item.get('Regra_Especial', '')).upper():
@@ -171,62 +216,59 @@ class MotorAlocacao:
                 "sala": "EAD", "ch_total": ch, "meta": ch, "is_ead": True
             })
 
-        # Filtro Sexta
         eh_curso_sem_sexta = any(c in str(item['ID_Turma']).upper() for c in CURSOS_SEM_SEXTA)
         if dia == 'Sexta-Feira' and eh_curso_sem_sexta and not forcar_sexta:
             return (False, 0, None)
 
-        # Definição da Sala
-        sala_alvo = ""
-        if modo_fic:
-            # FIC procura qualquer buraco
-            pass # Lógica de busca dinâmica abaixo
-        else:
-            # Regular usa Sala Base
-            sala_alvo = self.sala_base.get(item['ID_Turma'], "PENDENTE")
-
-        # Lógica de Alocação (Simplificada para brevidade, mas com Sala Base)
         if item['Tipo'] == "PAREO":
             u1, u2 = item['Componentes'][0], item['Componentes'][1]
             ordens = [[(u1, 15), (u2, 5)], [(u2, 5), (u1, 15)]]
             for config in ordens:
                 p1, dur1 = config[0]
                 p2, dur2 = config[1]
-                
-                # Início sempre na semana 1 ou 2 para Regulares
-                inicio_real = 2 if dia in ['Segunda-Feira', 'Terça-Feira', 'Quarta-Feira'] else 1
-                
-                # Verifica P1
-                docs1 = [d.strip() for d in str(p1['Docentes']).split(',')]
-                if any(self.verificar_bloqueio_docente(d, dia, item['Turno'], inicio_real, inicio_real+dur1) for d in docs1): continue
-                
-                # Sala P1
-                sala1 = sala_alvo
-                if modo_fic: # Busca dinâmica para FIC
-                    for s in SALAS_TEORICAS:
-                        if not self.verificar_conflito([s], dia, item['Turno'], inicio_real, inicio_real+dur1): 
-                            sala1 = s; break
-                
-                if self.verificar_conflito([sala1] + docs1 + [str(item['ID_Turma'])], dia, item['Turno'], inicio_real, inicio_real+dur1): continue
+                inicio_base = 1
+                if item['Semana_Inicio']: inicio_base = int(item['Semana_Inicio'])
+                if "FIC" in str(item['ID_Turma']): inicio_base = 4
+                inicio_real = 2 if (inicio_base == 1 and dia in ['Segunda-Feira', 'Terça-Feira', 'Quarta-Feira']) else inicio_base
+                for shift in range(15):
+                    s1_ini, s1_fim = inicio_real + shift, inicio_real + shift + dur1 - 1
+                    s2_ini, s2_fim = s1_fim + 1, s1_fim + dur2
+                    if s2_fim > 22: continue
+                    
+                    docs1 = [d.strip() for d in str(p1['Docentes']).split(',')]
+                    if any(self.verificar_bloqueio_docente(d, dia, item['Turno'], s1_ini, s1_fim) for d in docs1): continue
+                    
+                    esp1 = str(p1['Espacos'])
+                    sala1 = ""
+                    if "Sala Teórica" in esp1: 
+                        sala1 = self.buscar_sala(item['ID_Turma'], dia, item['Turno'], s1_ini, s1_fim, modo_nomade)
+                    elif any(l in esp1 for l in LABS_AB) and s1_ini < 4:
+                        sala1 = self.buscar_sala(item['ID_Turma'], dia, item['Turno'], s1_ini, min(3, s1_fim), modo_nomade)
+                    
+                    if ("Sala Teórica" in esp1 or (any(l in esp1 for l in LABS_AB) and s1_ini < 4)) and not sala1: continue
 
-                # Verifica P2 (similar)
-                s2_ini = inicio_real + dur1
-                docs2 = [d.strip() for d in str(p2['Docentes']).split(',')]
-                if any(self.verificar_bloqueio_docente(d, dia, item['Turno'], s2_ini, s2_ini+dur2) for d in docs2): continue
-                
-                sala2 = sala_alvo
-                if modo_fic:
-                    for s in SALAS_TEORICAS:
-                        if not self.verificar_conflito([s], dia, item['Turno'], s2_ini, s2_ini+dur2): 
-                            sala2 = s; break
+                    rec1 = docs1 + [str(item['ID_Turma'])] + ([sala1] if sala1 else [])
+                    if any(l in esp1 for l in LABS_AB) and s1_fim >= 4: rec1 += [e.strip() for e in esp1.split('+') if e.strip() in LABS_AB]
+                    if self.verificar_conflito(rec1, dia, item['Turno'], s1_ini, s1_fim): continue
 
-                if self.verificar_conflito([sala2] + docs2 + [str(item['ID_Turma'])], dia, item['Turno'], s2_ini, s2_ini+dur2): continue
+                    docs2 = [d.strip() for d in str(p2['Docentes']).split(',')]
+                    if any(self.verificar_bloqueio_docente(d, dia, item['Turno'], s2_ini, s2_fim) for d in docs2): continue
+                    
+                    esp2 = str(p2['Espacos'])
+                    sala2 = ""
+                    if "Sala Teórica" in esp2:
+                        sala2 = self.buscar_sala(item['ID_Turma'], dia, item['Turno'], s2_ini, s2_fim, modo_nomade)
+                    
+                    if "Sala Teórica" in esp2 and not sala2: continue
 
-                return (True, 80, {
-                    "p1": p1, "s1_ini": inicio_real, "s1_fim": inicio_real+dur1-1, "rec1": docs1+[str(item['ID_Turma']), sala1], "sala1": sala1,
-                    "p2": p2, "s2_ini": s2_ini, "s2_fim": s2_ini+dur2-1, "rec2": docs2+[str(item['ID_Turma']), sala2], "sala2": sala2
-                })
+                    rec2 = docs2 + [str(item['ID_Turma'])] + ([sala2] if sala2 else [])
+                    if any(l in esp2 for l in LABS_AB) and s2_fim >= 4: rec2 += [e.strip() for e in esp2.split('+') if e.strip() in LABS_AB]
+                    if self.verificar_conflito(rec2, dia, item['Turno'], s2_ini, s2_fim): continue
 
+                    return (True, 80, {
+                        "p1": p1, "s1_ini": s1_ini, "s1_fim": s1_fim, "rec1": rec1, "sala1": sala1,
+                        "p2": p2, "s2_ini": s2_ini, "s2_fim": s2_fim, "rec2": rec2, "sala2": sala2
+                    })
         else: # SIMPLE
             ch_total = float(item['Carga_Horaria_Total'] or 0)
             dur_ideal = int(np.ceil(ch_total / 4))
@@ -234,82 +276,75 @@ class MotorAlocacao:
             if "80%" in str(item['Regra_Especial']):
                 meta_presencial = ch_total * 0.8
                 dur_ideal = int(np.ceil(meta_presencial / 4))
-
-            # Regra de Início: Se for Regular, tenta começar na Sem 1. Se for FIC, Sem 4.
             inicio_base = 1
-            if modo_fic: inicio_base = 4
-            elif item['Semana_Inicio']: inicio_base = int(item['Semana_Inicio'])
-            
+            if item['Semana_Inicio']: inicio_base = int(item['Semana_Inicio'])
+            if "FIC" in str(item['ID_Turma']): inicio_base = 4
             inicio_real = 2 if (inicio_base == 1 and dia in ['Segunda-Feira', 'Terça-Feira', 'Quarta-Feira']) else inicio_base
-
-            # Verifica Lab
-            usa_lab = any(l in str(item['Espacos']) for l in LABS_AB)
-            
-            # Se usa Lab, precisa de Sala Base (Sem 1-3) + Lab (Sem 4+)
-            # Se não usa Lab, precisa de Sala Base (Sem 1-Fim)
-            
-            sem_ini = inicio_real
-            sem_fim = sem_ini + dur_ideal - 1
-            if sem_fim > 22: sem_fim = 22
-            
-            docs = [d.strip() for d in str(item['Docentes']).split(',')]
-            if any(self.verificar_bloqueio_docente(d, dia, item['Turno'], sem_ini, sem_fim) for d in docs): return (False, 0, None)
-
-            rec_total = docs + [str(item['ID_Turma'])]
-            
-            # Fase A: Sala Teórica
-            fim_teorica = min(3, sem_fim) if usa_lab else sem_fim
-            sala_teorica = sala_alvo
-            if modo_fic:
-                sala_teorica = ""
-                for s in SALAS_TEORICAS:
-                    if not self.verificar_conflito([s], dia, item['Turno'], sem_ini, fim_teorica):
-                        sala_teorica = s; break
-            
-            if not sala_teorica or self.verificar_conflito([sala_teorica], dia, item['Turno'], sem_ini, fim_teorica): return (False, 0, None)
-            rec_total.append(sala_teorica)
-
-            # Fase B: Lab (se houver)
-            if usa_lab and sem_fim >= 4:
-                labs = [e.strip() for e in str(item['Espacos']).split('+') if e.strip() in LABS_AB]
-                if self.verificar_conflito(labs, dia, item['Turno'], 4, sem_fim): return (False, 0, None)
-                rec_total += labs
-
-            # Validação Final
-            if self.verificar_conflito(docs + [str(item['ID_Turma'])], dia, item['Turno'], sem_ini, sem_fim): return (False, 0, None)
-
-            return (True, dur_ideal*4, {
-                "rec": rec_total, "sem_ini": sem_ini, "sem_fim": sem_fim, "sala": sala_teorica, "ch_total": ch_total, "meta": meta_presencial
-            })
-
+            for shift in range(15):
+                sem_ini = inicio_real + shift
+                sem_fim = sem_ini + dur_ideal - 1
+                if sem_fim > 22: sem_fim = 22
+                dur_real = sem_fim - sem_ini + 1
+                if dur_real <= 0: break
+                docs = [d.strip() for d in str(item['Docentes']).split(',')]
+                if any(self.verificar_bloqueio_docente(d, dia, item['Turno'], sem_ini, sem_fim) for d in docs): continue
+                
+                esp = str(item['Espacos'])
+                sala = ""
+                rec = docs + [str(item['ID_Turma'])]
+                
+                if "Sala Teórica" in esp:
+                    sala = self.buscar_sala(item['ID_Turma'], dia, item['Turno'], sem_ini, sem_fim, modo_nomade)
+                    if not sala: continue 
+                    rec.append(sala)
+                elif any(l in esp for l in LABS_AB):
+                    if sem_ini < 4:
+                        sala = self.buscar_sala(item['ID_Turma'], dia, item['Turno'], sem_ini, min(3, sem_fim), modo_nomade)
+                        if not sala: continue
+                        rec.append(sala)
+                    if sem_fim >= 4: rec += [e.strip() for e in esp.split('+') if e.strip() in LABS_AB]
+                
+                if not self.verificar_conflito(rec, dia, item['Turno'], sem_ini, sem_fim):
+                    ch_presencial = dur_real * 4
+                    return (True, ch_presencial, {
+                        "rec": rec, "sem_ini": sem_ini, "sem_fim": sem_fim, "sala": sala, "ch_total": ch_total, "meta": meta_presencial
+                    })
         return (False, 0, None)
 
     def executar(self):
-        # 1. Zoneamento
         self.definir_zoneamento()
-        
         lista_demandas = self.preparar_demandas()
         
-        # Separa Regulares e FIC
-        regulares = [i for i in lista_demandas if "FIC" not in str(i['ID_Turma']).upper()]
-        fics = [i for i in lista_demandas if "FIC" in str(i['ID_Turma']).upper()]
+        # Separação VIP vs Nômade
+        vips = []
+        nomades = []
         
-        # Ordena Regulares (Pareados primeiro)
-        regulares.sort(key=lambda x: 0 if x['Tipo'] == "PAREO" else 1)
+        for item in lista_demandas:
+            t_upper = str(item['ID_Turma']).upper()
+            eh_nomade = any(k in t_upper for k in KEYWORDS_NOMADE)
+            if eh_nomade: nomades.append(item)
+            else: vips.append(item)
+            
+        # Ordena VIPs (Pareados primeiro)
+        vips.sort(key=lambda x: 0 if x['Tipo'] == "PAREO" else 1)
         
         total = len(lista_demandas)
         bar = st.progress(0)
         repescagem = []
 
-        # CAMADA 2: REGULARES
-        for idx, item in enumerate(regulares):
+        # FASE 1: VIPs (Usam Sala Base)
+        for idx, item in enumerate(vips):
             melhor = (False, -1, None, None)
             dias_teste = DIAS
             if item['Dia_Travado']: dias_teste = [item['Dia_Travado']]
 
             for dia in dias_teste:
-                sucesso, ch, config = self.simular_alocacao(item, dia, modo_fic=False)
-                if sucesso and ch > melhor[1]: melhor = (True, ch, dia, config)
+                sucesso, ch, config = self.simular_alocacao(item, dia, modo_nomade=False)
+                if sucesso:
+                    score = ch
+                    s_ini = config.get('s1_ini', config.get('sem_ini', 99))
+                    if s_ini <= 2: score += 50 
+                    if score > melhor[1]: melhor = (True, score, dia, config)
             
             if melhor[0]:
                 self.aplicar_resultado(item, melhor[2], melhor[3])
@@ -321,31 +356,76 @@ class MotorAlocacao:
                     repescagem.append(copy.deepcopy(item))
             bar.progress((idx + 1) / total)
 
-        # CAMADA 3: FIC + REPESCAGEM
-        fila_final = fics + repescagem
+        # FASE 2: NÔMADES + REPESCAGEM (Usam qualquer sala)
+        fila_final = nomades + repescagem
         for item in fila_final:
-            modo_fic = "FIC" in str(item['ID_Turma']).upper()
             melhor = (False, -1, None, None)
             dias_teste = DIAS
             if item.get('Dia_Travado'): dias_teste = [item['Dia_Travado']]
             
             for dia in dias_teste:
-                sucesso, ch, config = self.simular_alocacao(item, dia, modo_fic=True) # Modo FIC permite qualquer sala
-                if sucesso and ch > melhor[1]: melhor = (True, ch, dia, config)
+                sucesso, ch, config = self.simular_alocacao(item, dia, modo_nomade=True) 
+                if sucesso:
+                    score = ch
+                    s_ini = config.get('sem_ini', 99)
+                    if s_ini <= 2: score += 50
+                    if score > melhor[1]: melhor = (True, score, dia, config)
             
-            if not melhor[0]: # Válvula de Escape
-                sucesso, ch, config = self.simular_alocacao(item, 'Sexta-Feira', forcar_sexta=True, modo_fic=True)
+            if not melhor[0]:
+                sucesso, ch, config = self.simular_alocacao(item, 'Sexta-Feira', forcar_sexta=True, modo_nomade=True)
                 if sucesso: melhor = (True, ch, 'Sexta-Feira', config)
 
             if melhor[0]:
                 self.aplicar_resultado(item, melhor[2], melhor[3], " (Flex)")
             else:
-                # Último recurso EAD
-                self.grade.append({
-                    "ID_Turma": item['ID_Turma'], "UC": item['Nome_UC'], 
-                    "CH_Total": item.get('Carga_Horaria_Total'), "Dia": "EAD", "Turno": "EAD",
-                    "Docentes": item['Docentes'], "Espacos": "EAD", "Status": "⚠️ Alocado EAD (Falta de Espaço)"
-                })
+                # Tetris Final
+                ch_total = float(item.get('Carga_Horaria_Total', 0) or 0)
+                split_ok = False
+                if ch_total >= 40:
+                    for d1 in DIAS:
+                        if d1 == 'Sexta-Feira' and any(c in str(item['ID_Turma']) for c in CURSOS_SEM_SEXTA): continue
+                        for s1_ini in [17, 13, 9, 5, 1]: 
+                            s1_fim = s1_ini + 3
+                            if s1_fim > 22: continue
+                            docs = [d.strip() for d in str(item['Docentes']).split(',')]
+                            if any(self.verificar_bloqueio_docente(d, d1, item['Turno'], s1_ini, s1_fim) for d in docs): continue
+                            sala1 = self.buscar_sala(item['ID_Turma'], d1, item['Turno'], s1_ini, s1_fim, modo_nomade=True)
+                            if not sala1: continue
+                            rec1 = docs + [str(item['ID_Turma']), sala1]
+                            if self.verificar_conflito(rec1, d1, item['Turno'], s1_ini, s1_fim): continue
+                            
+                            for d2 in DIAS:
+                                if d2 == 'Sexta-Feira' and any(c in str(item['ID_Turma']) for c in CURSOS_SEM_SEXTA): continue
+                                for s2_ini in [17, 13, 9, 5, 1]:
+                                    s2_fim = s2_ini + 3
+                                    if s2_fim > 22: continue
+                                    if d1 == d2 and not (s2_ini > s1_fim or s2_fim < s1_ini): continue
+                                    if any(self.verificar_bloqueio_docente(d, d2, item['Turno'], s2_ini, s2_fim) for d in docs): continue
+                                    sala2 = self.buscar_sala(item['ID_Turma'], d2, item['Turno'], s2_ini, s2_fim, modo_nomade=True)
+                                    if not sala2: continue
+                                    rec2 = docs + [str(item['ID_Turma']), sala2]
+                                    if self.verificar_conflito(rec2, d2, item['Turno'], s2_ini, s2_fim): continue
+                                    self.reservar(rec1, d1, item['Turno'], s1_ini, s1_fim)
+                                    self.reservar(rec2, d2, item['Turno'], s2_ini, s2_fim)
+                                    self.grade.append({
+                                        "ID_Turma": item['ID_Turma'], "UC": item['Nome_UC'], "CH_Total": ch_total,
+                                        "Dia": f"{d1} e {d2}", "Turno": item['Turno'], "Docentes": item['Docentes'],
+                                        "Espacos": f"Split ({sala1}/{sala2})", "Semana_Inicio": f"{s1_ini}/{s2_ini}", 
+                                        "Semana_Fim": f"{s1_fim}/{s2_fim}", "Status": "✅ Alocado (Tetris 16h+16h)"
+                                    })
+                                    split_ok = True
+                                    break
+                                if split_ok: break
+                            if split_ok: break
+                        if split_ok: break
+                
+                if not split_ok:
+                    self.grade.append({
+                        "ID_Turma": item['ID_Turma'], "UC": item['Nome_UC'], 
+                        "CH_Total": ch_total, "Dia": "EAD", "Turno": "EAD",
+                        "Docentes": item['Docentes'], "Espacos": "EAD",
+                        "Status": "⚠️ Alocado EAD (Falta de Espaço)", "Obs": "Sem sala presencial disponível"
+                    })
 
         return pd.DataFrame(self.grade), self.erros
 
@@ -394,7 +474,7 @@ st.sidebar.download_button("📥 Baixar Modelo", gerar_template(), "modelo.xlsx"
 st.sidebar.markdown("---")
 up = st.sidebar.file_uploader("Upload Planilha", type=['xlsx'])
 
-if up and st.button("🚀 Rodar Otimizador V19"):
+if up and st.button("🚀 Rodar Otimizador V21"):
     try:
         df_dem = pd.read_excel(up, sheet_name='Demandas')
         try: df_doc = pd.read_excel(up, sheet_name='Docentes')
@@ -419,7 +499,7 @@ if up and st.button("🚀 Rodar Otimizador V19"):
                 z.writestr("04_Agenda_Docentes.csv", converter_csv(pd.DataFrame(rows)))
                 z.writestr("03_Ocupacao_Espacos.csv", converter_csv(df_res[['Dia', 'Turno', 'Espacos', 'ID_Turma', 'Semana_Inicio', 'Semana_Fim']]))
 
-        st.download_button("📦 Baixar Resultados (ZIP)", buf.getvalue(), "Resultados_V19.zip", "application/zip")
+        st.download_button("📦 Baixar Resultados (ZIP)", buf.getvalue(), "Resultados_V21.zip", "application/zip")
         st.dataframe(df_res)
         
     except Exception as e:
