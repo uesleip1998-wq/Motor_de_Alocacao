@@ -4,27 +4,24 @@ import numpy as np
 from io import BytesIO
 import zipfile
 
-# --- CONFIGURAÇÃO DA PÁGINA ---
-st.set_page_config(page_title="Motor Alocação IFSC v8.0", layout="wide")
-
-st.title("🧩 Motor de Alocação IFSC - Versão Flexível (V8)")
+# --- CONFIGURAÇÃO ---
+st.set_page_config(page_title="Motor Alocação IFSC v9.0", layout="wide")
+st.title("🧩 Motor de Alocação IFSC - Otimizador Intra-Turma (V9)")
 st.markdown("""
-**Melhorias da Versão 8.0:**
-1.  **Alocação Parcial:** Se não couber toda a carga, aloca o que der e avisa o restante.
-2.  **Sala Coringa:** Usa "Sala A Definir" nas semanas 1-3 se não houver sala física, para não travar a grade.
-3.  **Diagnóstico:** Relatório de erros aponta exatamente o causador do conflito.
+**Estratégia V9.0:**
+1.  **Troca de Dia:** Se o dia preferido falhar, tenta outros dias livres do docente.
+2.  **Inversão de Bloco:** UCs curtas (20h/40h) que falham no início são jogadas para o fim do semestre.
+3.  **Deslocamento:** Tenta iniciar em qualquer semana viável (Sliding Window).
 """)
 
-# --- 1. DADOS DE CONTEXTO ---
+# --- DADOS DE CONTEXTO ---
 LABS_AB = [
     "Lab. Panificação", "Lab. Confeitaria", "Lab. Habilidades", 
     "Lab. Produção", "Lab. Cozinha Regional", "Lab. Bebidas", "Lab. Panif/Conf"
 ]
-
 SALAS_TEORICAS_DISPONIVEIS = [f"Sala {i}" for i in range(1, 13) if i != 6]
 
-# --- 2. FUNÇÕES AUXILIARES ---
-
+# --- FUNÇÕES ---
 def gerar_template():
     df = pd.DataFrame(columns=[
         "ID_Turma", "Nome_UC", "Turno", "Docentes", "Espacos", 
@@ -39,22 +36,24 @@ def gerar_template():
 def converter_df_para_csv(df):
     return df.to_csv(index=False).encode('utf-8-sig')
 
-# --- 3. CLASSE DO MOTOR ---
-
+# --- MOTOR V9 ---
 class MotorAlocacao:
     def __init__(self, df_demandas, df_docentes_restricoes):
         self.demandas = df_demandas.fillna("")
         self.restricoes_docentes = df_docentes_restricoes.fillna("")
         self.grade = []
         self.log_erros = []
-        self.ocupacao = {} 
+        self.ocupacao = {} # Chave: "RECURSO|DIA|TURNO" -> Set de semanas
 
-    def verificar_restricao_docente(self, docente, sem_ini, sem_fim):
+    def verificar_bloqueio_docente(self, docente, dia, turno):
+        """Verifica se o docente tem bloqueio fixo (ex: Não trabalha 4ª Feira)"""
         try:
             regra = self.restricoes_docentes[self.restricoes_docentes['Nome_Docente'] == docente]
             if not regra.empty:
-                obs = str(regra.iloc[0]['Restricoes_Extras']).lower()
-                if "licença" in obs: return True
+                dias_indisp = str(regra.iloc[0]['Dias_Indisponiveis'])
+                # Procura "Quarta-Feira" E "Noturno" na mesma string de restrição
+                if dia in dias_indisp and turno in dias_indisp:
+                    return True
         except:
             pass
         return False
@@ -62,209 +61,184 @@ class MotorAlocacao:
     def verificar_disponibilidade(self, recursos, dia, turno, sem_ini, sem_fim):
         conflitos = []
         semanas_solicitadas = set(range(sem_ini, sem_fim + 1))
-
         for recurso in recursos:
             chave = f"{recurso}|{dia}|{turno}"
             if chave in self.ocupacao:
-                semanas_ocupadas = self.ocupacao[chave]
-                if not semanas_solicitadas.isdisjoint(semanas_ocupadas):
+                if not semanas_solicitadas.isdisjoint(self.ocupacao[chave]):
                     conflitos.append(recurso)
         return conflitos
 
-    def reservar_recursos(self, recursos, dia, turno, sem_ini, sem_fim):
-        semanas_novas = set(range(sem_ini, sem_fim + 1))
+    def reservar(self, recursos, dia, turno, sem_ini, sem_fim):
+        semanas = set(range(sem_ini, sem_fim + 1))
         for recurso in recursos:
             chave = f"{recurso}|{dia}|{turno}"
-            if chave not in self.ocupacao:
-                self.ocupacao[chave] = set()
-            self.ocupacao[chave].update(semanas_novas)
+            if chave not in self.ocupacao: self.ocupacao[chave] = set()
+            self.ocupacao[chave].update(semanas)
 
-    def buscar_sala_teorica_livre(self, dia, turno, sem_ini, sem_fim):
+    def buscar_sala_teorica(self, dia, turno, sem_ini, sem_fim):
         for sala in SALAS_TEORICAS_DISPONIVEIS:
-            conflitos = self.verificar_disponibilidade([sala], dia, turno, sem_ini, sem_fim)
-            if not conflitos:
+            if not self.verificar_disponibilidade([sala], dia, turno, sem_ini, sem_fim):
                 return sala
-        # MUDANÇA V8: Retorna Coringa se não achar sala real
         return "Sala Teórica (A Definir)"
 
     def executar(self):
         dias_uteis = ['Segunda-Feira', 'Terça-Feira', 'Quarta-Feira', 'Quinta-Feira', 'Sexta-Feira']
         
-        # Prioridade Inteligente
-        def calcular_prioridade(row):
-            docentes = [d.strip() for d in str(row['Docentes']).split(',')]
-            tem_licenca = any(self.verificar_restricao_docente(d, 1, 22) for d in docentes)
-            dia_travado = bool(row['Dia_Travado'])
-            if tem_licenca: return 0
-            if dia_travado: return 1
-            return 2
-
-        self.demandas['Prioridade_Calc'] = self.demandas.apply(calcular_prioridade, axis=1)
-        demandas_ordenadas = self.demandas.sort_values('Prioridade_Calc')
+        # Ordenação: Prioriza quem tem dia travado DE VERDADE (ex: professor externo)
+        # Mas deixa UCs comuns para o fim para terem flexibilidade
+        self.demandas['Prioridade'] = self.demandas.apply(lambda x: 1 if x['Dia_Travado'] else 2, axis=1)
+        demandas_ordenadas = self.demandas.sort_values('Prioridade')
         
-        total_items = len(demandas_ordenadas)
-        progress_bar = st.progress(0)
+        total = len(demandas_ordenadas)
+        bar = st.progress(0)
 
         for idx, row in demandas_ordenadas.iterrows():
             alocado = False
             
+            # Parsing
             docentes = [d.strip() for d in str(row['Docentes']).split(',') if d.strip()]
-            espacos_originais = [e.strip() for e in str(row['Espacos']).split('+') if e.strip()]
+            espacos = [e.strip() for e in str(row['Espacos']).split('+') if e.strip()]
             id_turma = str(row['ID_Turma']).strip()
+            ch_total = float(row['Carga_Horaria_Total'] or 0)
+            duracao_ideal = int(np.ceil(ch_total / 4))
             
-            ch_total = float(row['Carga_Horaria_Total']) if row['Carga_Horaria_Total'] else 0
-            duracao_semanas_ideal = int(np.ceil(ch_total / 4))
-            sem_ini_base = int(row['Semana_Inicio']) if row['Semana_Inicio'] != "" else 1
-            
-            dias_tentativa = [row['Dia_Travado']] if row['Dia_Travado'] else dias_uteis
+            # --- ESTRATÉGIA DE DIAS (NÍVEL 1) ---
+            # Se tiver dia travado, começa por ele. Se falhar, tenta os outros.
+            # Se NÃO tiver dia travado, tenta todos na ordem padrão.
+            dias_preferencia = [row['Dia_Travado']] if row['Dia_Travado'] else dias_uteis
+            if row['Dia_Travado']: # Adiciona os outros dias como backup
+                dias_backup = [d for d in dias_uteis if d != row['Dia_Travado']]
+                dias_tentativa = dias_preferencia + dias_backup
+            else:
+                dias_tentativa = dias_uteis
 
-            melhor_resultado_parcial = None # Guarda o melhor erro encontrado
+            motivo_falha = ""
 
             for dia in dias_tentativa:
                 if alocado: break
 
-                sem_ini_ajustado = sem_ini_base
-                if sem_ini_ajustado == 1 and dia in ['Segunda-Feira', 'Terça-Feira', 'Quarta-Feira']:
-                    sem_ini_ajustado = 2
+                # Checa bloqueio fixo do docente (Hard Constraint)
+                bloqueado = False
+                for doc in docentes:
+                    if self.verificar_bloqueio_docente(doc, dia, row['Turno']):
+                        bloqueado = True
+                        motivo_falha = f"Bloqueio Fixo de {doc} na {dia}"
+                        break
+                if bloqueado: continue
+
+                # --- ESTRATÉGIA DE BLOCOS (NÍVEL 3) ---
+                # Define pontos de partida: Início (Sem 1) e Meio (Sem 11)
+                pontos_partida = [1]
+                if duracao_ideal <= 11: # Se for curta, pode tentar começar no Bloco 2
+                    pontos_partida.append(11)
                 
-                # Tenta encaixar (Sliding Window)
-                for deslocamento in range(15): 
-                    sem_ini_teste = sem_ini_ajustado + deslocamento
-                    sem_fim_teste = sem_ini_teste + duracao_semanas_ideal - 1
-                    
-                    # Truncamento para fim do semestre (Alocação Parcial)
-                    fim_semestre = 22
-                    if sem_fim_teste > fim_semestre:
-                        sem_fim_teste = fim_semestre
-                    
-                    duracao_real = sem_fim_teste - sem_ini_teste + 1
-                    if duracao_real <= 0: break
+                # Se o usuário forçou semana, respeita
+                if row['Semana_Inicio']: pontos_partida = [int(row['Semana_Inicio'])]
 
-                    # Lógica de Laboratórios
-                    usa_lab_ab = any(esp in LABS_AB for esp in espacos_originais)
+                for inicio_bloco in pontos_partida:
+                    if alocado: break
                     
-                    recursos_fase_1 = [] 
-                    recursos_fase_2 = [] 
-                    
-                    if usa_lab_ab and sem_ini_teste < 4:
-                        sala_teorica = self.buscar_sala_teorica_livre(dia, row['Turno'], sem_ini_teste, min(3, sem_fim_teste))
-                        recursos_fase_1 = docentes + [sala_teorica, id_turma]
-                        if sem_fim_teste >= 4:
-                            recursos_fase_2 = docentes + espacos_originais + [id_turma]
-                    else:
-                        recursos_fase_2 = docentes + espacos_originais + [id_turma]
+                    # Ajuste Calendário (Semana 1 só Qui/Sex)
+                    inicio_real = inicio_bloco
+                    if inicio_real == 1 and dia in ['Segunda-Feira', 'Terça-Feira', 'Quarta-Feira']:
+                        inicio_real = 2
 
-                    # Verificação
-                    conflitos_f1 = []
-                    conflitos_f2 = []
-                    
-                    if recursos_fase_1:
-                        conflitos_f1 = self.verificar_disponibilidade(recursos_fase_1, dia, row['Turno'], sem_ini_teste, min(3, sem_fim_teste))
-                    
-                    sem_ini_f2 = max(4, sem_ini_teste) if usa_lab_ab else sem_ini_teste
-                    if recursos_fase_2 and sem_fim_teste >= sem_ini_f2:
-                        conflitos_f2 = self.verificar_disponibilidade(recursos_fase_2, dia, row['Turno'], sem_ini_f2, sem_fim_teste)
-
-                    if not conflitos_f1 and not conflitos_f2:
-                        # SUCESSO!
-                        if recursos_fase_1: self.reservar_recursos(recursos_fase_1, dia, row['Turno'], sem_ini_teste, min(3, sem_fim_teste))
-                        if recursos_fase_2 and sem_fim_teste >= sem_ini_f2: self.reservar_recursos(recursos_fase_2, dia, row['Turno'], sem_ini_f2, sem_fim_teste)
+                    # --- ESTRATÉGIA DE DESLOCAMENTO (NÍVEL 2) ---
+                    # Tenta deslizar até 10 semanas para achar vaga
+                    for shift in range(11):
+                        sem_ini = inicio_real + shift
+                        sem_fim = sem_ini + duracao_ideal - 1
                         
-                        ch_alocada = duracao_real * 4
-                        status = "✅ Alocado"
-                        obs = ""
+                        # Truncamento (Alocação Parcial)
+                        if sem_fim > 22: sem_fim = 22
+                        duracao_real = sem_fim - sem_ini + 1
+                        if duracao_real <= 0: break
+
+                        # Lógica de Recursos (Labs vs Teórica)
+                        usa_lab = any(e in LABS_AB for e in espacos)
                         
-                        if ch_alocada < ch_total:
-                            status = "⚠️ Parcial"
-                            obs = f"Alocado {ch_alocada}h. Faltam {ch_total - ch_alocada}h (Sugerido EAD)"
-                            self.log_erros.append(f"⚠️ {row['ID_Turma']} - {row['Nome_UC']}: {obs}")
+                        rec_f1 = [] # Sem 1-3
+                        rec_f2 = [] # Sem 4+
+                        
+                        if usa_lab and sem_ini < 4:
+                            sala_t = self.buscar_sala_teorica(dia, row['Turno'], sem_ini, min(3, sem_fim))
+                            rec_f1 = docentes + [sala_t, id_turma]
+                            if sem_fim >= 4:
+                                rec_f2 = docentes + espacos + [id_turma]
+                        else:
+                            rec_f2 = docentes + espacos + [id_turma]
 
-                        espaco_final = " + ".join(espacos_originais)
-                        if recursos_fase_1:
-                            sala_temp = [r for r in recursos_fase_1 if "Sala" in r][0]
-                            espaco_final = f"{sala_temp} (Sem {sem_ini_teste}-3) -> {espaco_final} (Sem 4+)"
+                        # Checagem Final
+                        conf_f1 = []
+                        conf_f2 = []
+                        if rec_f1: conf_f1 = self.verificar_disponibilidade(rec_f1, dia, row['Turno'], sem_ini, min(3, sem_fim))
+                        sem_ini_f2 = max(4, sem_ini) if usa_lab else sem_ini
+                        if rec_f2 and sem_fim >= sem_ini_f2:
+                            conf_f2 = self.verificar_disponibilidade(rec_f2, dia, row['Turno'], sem_ini_f2, sem_fim)
 
-                        self.grade.append({
-                            "ID_Turma": row['ID_Turma'], "UC": row['Nome_UC'], "Dia": dia,
-                            "Turno": row['Turno'], "Docentes": ", ".join(docentes),
-                            "Espacos": espaco_final, "Semana_Inicio": sem_ini_teste,
-                            "Semana_Fim": sem_fim_teste, "Status": status, "Obs": obs
-                        })
-                        alocado = True
-                        break 
-                    else:
-                        # Guarda o motivo detalhado
-                        todos_conflitos = list(set(conflitos_f1 + conflitos_f2))
-                        if not melhor_resultado_parcial:
-                            melhor_resultado_parcial = f"Conflito com: {', '.join(todos_conflitos)}"
-                
-                if alocado: break
+                        if not conf_f1 and not conf_f2:
+                            # SUCESSO!
+                            if rec_f1: self.reservar(rec_f1, dia, row['Turno'], sem_ini, min(3, sem_fim))
+                            if rec_f2 and sem_fim >= sem_ini_f2: self.reservar(rec_f2, dia, row['Turno'], sem_ini_f2, sem_fim)
+                            
+                            status = "✅ Alocado"
+                            obs = ""
+                            if (duracao_real * 4) < ch_total:
+                                status = "⚠️ Parcial"
+                                obs = f"Faltam {ch_total - (duracao_real*4)}h"
+
+                            espaco_str = " + ".join(espacos)
+                            if rec_f1:
+                                sala_t = [r for r in rec_f1 if "Sala" in r][0]
+                                espaco_str = f"{sala_t} (Sem {sem_ini}-3) -> {espaco_str}"
+
+                            self.grade.append({
+                                "ID_Turma": id_turma, "UC": row['Nome_UC'], "Dia": dia,
+                                "Turno": row['Turno'], "Docentes": ", ".join(docentes),
+                                "Espacos": espaco_str, "Semana_Inicio": sem_ini,
+                                "Semana_Fim": sem_fim, "Status": status, "Obs": obs
+                            })
+                            alocado = True
+                            break # Sai do Shift
+                        else:
+                            motivo_falha = f"Conflito: {list(set(conf_f1+conf_f2))}"
+                    
+                    if alocado: break # Sai do Bloco
+                if alocado: break # Sai do Dia
 
             if not alocado:
-                motivo = melhor_resultado_parcial if melhor_resultado_parcial else "Sem dias compatíveis"
-                self.log_erros.append(f"❌ {row['ID_Turma']} - {row['Nome_UC']}: {motivo}")
-                self.grade.append({
-                    "ID_Turma": row['ID_Turma'], "UC": row['Nome_UC'], "Status": "❌ Erro", "Obs": motivo
-                })
+                self.log_erros.append(f"❌ {id_turma} - {row['Nome_UC']}: {motivo_falha}")
+                self.grade.append({"ID_Turma": id_turma, "UC": row['Nome_UC'], "Status": "❌ Erro", "Obs": motivo_falha})
 
-            progress_bar.progress((idx + 1) / total_items)
+            bar.progress((idx + 1) / total)
 
         return pd.DataFrame(self.grade), self.log_erros
 
-# --- 4. INTERFACE ---
-
+# --- INTERFACE ---
 st.sidebar.header("📂 Área de Trabalho")
-st.sidebar.download_button("📥 Baixar Modelo", gerar_template(), "modelo_demandas.xlsx")
+st.sidebar.download_button("📥 Baixar Modelo", gerar_template(), "modelo.xlsx")
 st.sidebar.markdown("---")
-uploaded_file = st.sidebar.file_uploader("Carregar Planilha", type=['xlsx'])
+up = st.sidebar.file_uploader("Upload Planilha", type=['xlsx'])
 
-if uploaded_file:
-    if st.button("🚀 Iniciar Alocação V8"):
-        try:
-            df_demandas = pd.read_excel(uploaded_file, sheet_name='Demandas')
-            try:
-                df_docentes = pd.read_excel(uploaded_file, sheet_name='Docentes')
-            except:
-                df_docentes = pd.DataFrame()
-
-            motor = MotorAlocacao(df_demandas, df_docentes)
-            df_grade, erros = motor.executar()
-            
-            st.success("Processamento Concluído!")
-            
-            # Geração de Arquivos
-            csv_grade = converter_df_para_csv(df_grade)
-            df_erros = pd.DataFrame(erros, columns=["Mensagem"])
-            csv_erros = converter_df_para_csv(df_erros)
-            
-            df_ok = df_grade[df_grade['Status'].str.contains("Alocado|Parcial")].copy()
-            if not df_ok.empty:
-                df_espacos = df_ok[['Dia', 'Turno', 'Espacos', 'ID_Turma', 'UC']].sort_values(['Dia', 'Turno', 'Espacos'])
-                csv_espacos = converter_df_para_csv(df_espacos)
-                
-                df_docentes_report = df_ok[['Docentes', 'Dia', 'Turno', 'ID_Turma', 'UC']].sort_values(['Docentes', 'Dia'])
-                csv_docentes = converter_df_para_csv(df_docentes_report)
-            else:
-                csv_espacos = b""
-                csv_docentes = b""
-
-            zip_buffer = BytesIO()
-            with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
-                zip_file.writestr("01_Grade_Geral.csv", csv_grade)
-                zip_file.writestr("02_Relatorio_Erros_Detelhado.csv", csv_erros)
-                if not df_ok.empty:
-                    zip_file.writestr("03_Ocupacao_Espacos.csv", csv_espacos)
-                    zip_file.writestr("04_Agenda_Docentes.csv", csv_docentes)
-            
-            st.download_button(
-                label="📦 Baixar Pacote ZIP (V8)",
-                data=zip_buffer.getvalue(),
-                file_name="Relatorios_Alocacao_IFSC_V8.zip",
-                mime="application/zip"
-            )
-            
-            st.subheader("Visualização (Grade)")
-            st.dataframe(df_grade)
-            
-        except Exception as e:
-            st.error(f"Erro Crítico: {e}")
+if up and st.button("🚀 Rodar Otimizador V9"):
+    try:
+        df_dem = pd.read_excel(up, sheet_name='Demandas')
+        try: df_doc = pd.read_excel(up, sheet_name='Docentes')
+        except: df_doc = pd.DataFrame()
+        
+        motor = MotorAlocacao(df_dem, df_doc)
+        df_res, erros = motor.executar()
+        
+        st.success("Otimização Concluída!")
+        
+        # ZIP
+        buf = BytesIO()
+        with zipfile.ZipFile(buf, "a", zipfile.ZIP_DEFLATED, False) as z:
+            z.writestr("01_Grade.csv", converter_df_para_csv(df_res))
+            z.writestr("02_Erros.csv", converter_df_para_csv(pd.DataFrame(erros, columns=["Erro"])))
+        
+        st.download_button("📦 Baixar Resultados (ZIP)", buf.getvalue(), "Resultados_V9.zip", "application/zip")
+        st.dataframe(df_res)
+        
+    except Exception as e:
+        st.error(f"Erro: {e}")
