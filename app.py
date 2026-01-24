@@ -10,9 +10,9 @@ st.set_page_config(page_title="Motor Alocação IFSC v8.0", layout="wide")
 st.title("🧩 Motor de Alocação IFSC - Versão Flexível (V8)")
 st.markdown("""
 **Melhorias da Versão 8.0:**
-1.  **Alocação Resiliente:** Se não couber toda a carga horária, aloca o que der e sugere EAD para o resto.
-2.  **Sala Teórica Virtual:** Se faltar sala nas semanas 1-3, usa "Sala A Definir" para não travar a grade.
-3.  **Diagnóstico de Falha:** O relatório de erros agora diz EXATAMENTE o que faltou (Docente, Sala ou Calendário).
+1.  **Alocação Parcial:** Se não couber toda a carga, aloca o que der e avisa o restante.
+2.  **Sala Coringa:** Usa "Sala A Definir" nas semanas 1-3 se não houver sala física, para não travar a grade.
+3.  **Diagnóstico:** Relatório de erros aponta exatamente o causador do conflito.
 """)
 
 # --- 1. DADOS DE CONTEXTO ---
@@ -84,7 +84,7 @@ class MotorAlocacao:
             conflitos = self.verificar_disponibilidade([sala], dia, turno, sem_ini, sem_fim)
             if not conflitos:
                 return sala
-        # MUDANÇA V8: Se não achar, retorna uma sala virtual para não travar
+        # MUDANÇA V8: Retorna Coringa se não achar sala real
         return "Sala Teórica (A Definir)"
 
     def executar(self):
@@ -118,7 +118,7 @@ class MotorAlocacao:
             
             dias_tentativa = [row['Dia_Travado']] if row['Dia_Travado'] else dias_uteis
 
-            melhor_resultado_parcial = None
+            melhor_resultado_parcial = None # Guarda o melhor erro encontrado
 
             for dia in dias_tentativa:
                 if alocado: break
@@ -166,7 +166,7 @@ class MotorAlocacao:
                         conflitos_f2 = self.verificar_disponibilidade(recursos_fase_2, dia, row['Turno'], sem_ini_f2, sem_fim_teste)
 
                     if not conflitos_f1 and not conflitos_f2:
-                        # SUCESSO TOTAL OU PARCIAL
+                        # SUCESSO!
                         if recursos_fase_1: self.reservar_recursos(recursos_fase_1, dia, row['Turno'], sem_ini_teste, min(3, sem_fim_teste))
                         if recursos_fase_2 and sem_fim_teste >= sem_ini_f2: self.reservar_recursos(recursos_fase_2, dia, row['Turno'], sem_ini_f2, sem_fim_teste)
                         
@@ -176,7 +176,7 @@ class MotorAlocacao:
                         
                         if ch_alocada < ch_total:
                             status = "⚠️ Parcial"
-                            obs = f"Alocado {ch_alocada}h. Faltam {ch_total - ch_alocada}h (EAD)"
+                            obs = f"Alocado {ch_alocada}h. Faltam {ch_total - ch_alocada}h (Sugerido EAD)"
                             self.log_erros.append(f"⚠️ {row['ID_Turma']} - {row['Nome_UC']}: {obs}")
 
                         espaco_final = " + ".join(espacos_originais)
@@ -193,7 +193,7 @@ class MotorAlocacao:
                         alocado = True
                         break 
                     else:
-                        # Guarda o motivo da falha para o relatório
+                        # Guarda o motivo detalhado
                         todos_conflitos = list(set(conflitos_f1 + conflitos_f2))
                         if not melhor_resultado_parcial:
                             melhor_resultado_parcial = f"Conflito com: {', '.join(todos_conflitos)}"
