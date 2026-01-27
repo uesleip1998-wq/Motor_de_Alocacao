@@ -9,12 +9,13 @@ import time
 import random
 
 # --- CONFIGURAÇÃO ---
-st.set_page_config(page_title="Motor Alocação IFSC v23.2 (Fix Config)", layout="wide")
-st.title("🧩 Motor de Alocação IFSC - V23.2 (Correção Config)")
+st.set_page_config(page_title="Motor Alocação IFSC v23.3 (Debug)", layout="wide")
+st.title("🧩 Motor de Alocação IFSC - V23.3 (Modo Detetive)")
 st.markdown("""
-**Correções V23.2:**
-1.  **Fix Erro 'config':** Tratamento correto de itens EAD na validação.
-2.  **Time-Boxing:** Mantido limite de 5 min.
+**Lógica V23.3:**
+1.  **Confiança na Planilha:** CH_Total é usada como está (ajuste manual de 80% esperado).
+2.  **Logs Detalhados:** Relatório de erros explica o motivo exato de cada falha.
+3.  **Time-Box:** 5 minutos.
 """)
 
 # --- CONSTANTES ---
@@ -26,7 +27,7 @@ LABS_AB = [
 ]
 SALAS_TEORICAS = [f"Sala {i}" for i in range(1, 13) if i != 6]
 SALAS_BACKUP = ["Restaurante 1", "Lab. Informática 1", "Lab. Informática 2"]
-MAX_TIME_SEC = 300  # 5 Minutos
+MAX_TIME_SEC = 300
 
 # --- FUNÇÕES AUXILIARES ---
 def gerar_template():
@@ -49,7 +50,8 @@ class MotorAlocacao:
         self.demandas = df_demandas.fillna("")
         self.restricoes = df_docentes.fillna("")
         self.grade_final = []
-        self.erros = []
+        self.erros = [] # Lista de strings simples
+        self.logs_detalhados = [] # Lista de dicionários para CSV
         self.sala_base = {} 
         self.start_time = 0
         self.melhor_grade = []
@@ -63,15 +65,15 @@ class MotorAlocacao:
             regra = self.restricoes[self.restricoes['Nome_Docente'] == docente]
             if not regra.empty:
                 dias_indisp = str(regra.iloc[0]['Dias_Indisponiveis'])
-                if dia in dias_indisp and turno in dias_indisp: return True
+                if dia in dias_indisp and turno in dias_indisp: return f"Indisponibilidade Docente ({dia})"
                 
                 if 'Bloqueio_Semana_Inicio' in regra.columns:
                     b_ini = int(regra.iloc[0]['Bloqueio_Semana_Inicio'] or 0)
                     b_fim = int(regra.iloc[0]['Bloqueio_Semana_Fim'] or 0)
                     if b_ini > 0 and b_fim > 0:
-                        if not (sem_fim < b_ini or sem_ini > b_fim): return True
+                        if not (sem_fim < b_ini or sem_ini > b_fim): return f"Bloqueio Semanal Docente ({b_ini}-{b_fim})"
         except: pass
-        return False
+        return None
 
     def otimizar_dados_entrada(self):
         df = self.demandas.copy()
@@ -160,7 +162,6 @@ class MotorAlocacao:
         espacos_str = str(item.get('Espacos', '')).upper()
         if "EAD" in espacos_str or "100% EAD" in str(item.get('Regra_Especial', '')).upper():
             nova_grade = copy.deepcopy(grade_atual)
-            # Item EAD não tem 'config', mas tem 'is_ead'
             nova_grade.append(item | {"Alocacao": {"dia": "EAD", "sala": "EAD", "sem_ini": 1, "sem_fim": 20, "status": "✅ Alocado (EAD)", "is_ead": True}})
             return self.resolver_grade(restante, nova_grade)
 
@@ -177,9 +178,9 @@ class MotorAlocacao:
         else:
             sala_visual = "Virtual/Sem Sala"
 
+        # CH Pura da Planilha
         ch_total = float(item['Carga_Horaria_Total'] or 0)
-        ch_efetiva = ch_total * 0.8 if "80%" in str(item.get('Regra_Especial', '')) else ch_total
-        duracao_semanas = int(np.ceil(ch_efetiva / 4))
+        duracao_semanas = int(np.ceil(ch_total / 4))
         
         movimentos = []
         dias_teste = DIAS
@@ -212,8 +213,11 @@ class MotorAlocacao:
                             "recursos": recursos_necessarios, "ch": ch_total
                         })
         
+        tentativas_falhas = []
+        
         for mov in movimentos:
-            if self.movimento_valido(mov, item, grade_atual):
+            valido, motivo = self.movimento_valido(mov, item, grade_atual)
+            if valido:
                 nova_grade = copy.deepcopy(grade_atual)
                 status_str = "✅ Alocado"
                 if mov['tipo'] == "SPLIT": status_str += " (Split)"
@@ -232,8 +236,20 @@ class MotorAlocacao:
                 
                 sucesso, grade_final = self.resolver_grade(restante, nova_grade)
                 if sucesso: return True, grade_final
+            else:
+                # Registra o motivo da falha para este movimento específico
+                desc_mov = f"{mov['dia']} (Sem {mov['sem_ini']}-{mov['sem_fim']})" if mov['tipo'] == 'BLOCO' else f"Split {mov['dias']}"
+                tentativas_falhas.append(f"{desc_mov}: {motivo}")
         
-        self.erros.append(f"Falha Parcial: Não foi possível alocar {item['ID_Turma']} - {item['Nome_UC']}")
+        # Se chegou aqui, falhou em todos os movimentos
+        self.erros.append(f"Falha: {item['ID_Turma']} - {item['Nome_UC']}")
+        self.logs_detalhados.append({
+            "ID_Turma": item['ID_Turma'],
+            "UC": item['Nome_UC'],
+            "Tentativas": len(movimentos),
+            "Detalhes_Falha": " | ".join(tentativas_falhas[:5]) + "..." # Limita tamanho
+        })
+        
         return self.resolver_grade(restante, grade_atual)
 
     def movimento_valido(self, mov, item, grade):
@@ -248,11 +264,15 @@ class MotorAlocacao:
             slots_teste.append((mov['dias'][0], mov['sem_ini'], mov['sem_fim']))
             slots_teste.append((mov['dias'][1], mov['sem_ini'], mov['sem_fim']))
 
+        # Verifica Bloqueio Docente (Prioritário)
+        for d_t, ini_t, fim_t in slots_teste:
+            for d in docs_item:
+                motivo_doc = self.verificar_bloqueio_docente(d, d_t, turno_item, ini_t, fim_t)
+                if motivo_doc: return False, motivo_doc
+
         for alocada in grade:
-            # CORREÇÃO AQUI: Se for EAD, ignora na validação física
             if alocada['Alocacao'].get('is_ead'): continue
             
-            # Se não é EAD, tem 'config'
             cfg = alocada['Alocacao']['config']
             turno_aloc = alocada['Turno']
             if turno_item != turno_aloc: continue 
@@ -268,18 +288,21 @@ class MotorAlocacao:
                 for d_a, ini_a, fim_a in slots_aloc:
                     if d_t == d_a:
                         if not (fim_t < ini_a or ini_t > fim_a):
-                            if turma_item == str(alocada['ID_Turma']): return False
+                            # Colisão Temporal
+                            if turma_item == str(alocada['ID_Turma']): 
+                                return False, f"Turma Ocupada com {alocada['UC']}"
+                            
                             docs_aloc = [d.strip() for d in str(alocada['Docentes']).split(',')]
-                            if any(d in docs_aloc for d in docs_item): return False
+                            if any(d in docs_aloc for d in docs_item): 
+                                return False, f"Docente Ocupado em {alocada['ID_Turma']}"
+                            
                             rec_t = mov.get('recursos', [])
                             rec_a = cfg.get('recursos', [])
                             if rec_t and rec_a:
-                                if any(r in rec_a for r in rec_t): return False
-        
-        for d_t, ini_t, fim_t in slots_teste:
-             if any(self.verificar_bloqueio_docente(d, d_t, turno_item, ini_t, fim_t) for d in docs_item): return False
+                                if any(r in rec_a for r in rec_t): 
+                                    return False, f"Sala/Lab Ocupado por {alocada['ID_Turma']}"
 
-        return True
+        return True, "OK"
 
     def executar(self):
         self.start_time = time.time()
@@ -287,13 +310,12 @@ class MotorAlocacao:
         fila = self.preparar_demandas()
         
         msg_area = st.empty()
-        msg_area.info("Iniciando alocação Time-Boxed (Máx 5 min)...")
+        msg_area.info("Iniciando alocação V23.3...")
         
         sucesso, grade_resolvida = self.resolver_grade(fila, [])
         
         if not grade_resolvida and self.melhor_grade:
             grade_resolvida = self.melhor_grade
-            self.erros.append("Alerta: Solução Parcial (Tempo Esgotado ou Conflitos)")
 
         res = []
         for item in grade_resolvida:
@@ -311,10 +333,10 @@ class MotorAlocacao:
             if uid not in alocados_ids:
                 res.append({
                     "ID_Turma": item['ID_Turma'], "UC": item['Nome_UC'], "CH_Total": item['Carga_Horaria_Total'],
-                    "Status": "❌ Não Alocado (Timeout/Conflito)"
+                    "Status": "❌ Não Alocado"
                 })
 
-        return pd.DataFrame(res), self.erros
+        return pd.DataFrame(res), self.logs_detalhados
 
 # --- INTERFACE ---
 st.sidebar.header("📂 Área de Trabalho")
@@ -322,28 +344,29 @@ st.sidebar.download_button("📥 Baixar Modelo", gerar_template(), "modelo.xlsx"
 st.sidebar.markdown("---")
 up = st.sidebar.file_uploader("Upload Planilha", type=['xlsx'])
 
-if up and st.button("🚀 Rodar Otimizador V23.2"):
+if up and st.button("🚀 Rodar Otimizador V23.3"):
     try:
         df_dem = pd.read_excel(up, sheet_name='Demandas')
         try: df_doc = pd.read_excel(up, sheet_name='Docentes')
         except: df_doc = pd.DataFrame()
         
         motor = MotorAlocacao(df_dem, df_doc)
-        df_res, erros = motor.executar()
+        df_res, logs = motor.executar()
         
         st.success("Processamento Finalizado!")
         
-        if erros:
-            st.warning(f"{len(erros)} itens requerem atenção.")
-            with st.expander("Ver Detalhes dos Erros"):
-                st.write(erros)
+        if logs:
+            st.warning(f"{len(logs)} itens não foram alocados.")
+            df_logs = pd.DataFrame(logs)
+            st.dataframe(df_logs)
 
         buf = BytesIO()
         with zipfile.ZipFile(buf, "a", zipfile.ZIP_DEFLATED, False) as z:
             z.writestr("01_Grade_Geral.csv", converter_csv(df_res))
+            z.writestr("02_Relatorio_Erros_Detalhados.csv", converter_csv(pd.DataFrame(logs)))
             z.writestr("05_Dados_Brutos.json", df_res.to_json(orient='records', indent=4))
         
-        st.download_button("📦 Baixar Resultados (ZIP)", buf.getvalue(), "Resultados_V23.2.zip", "application/zip")
+        st.download_button("📦 Baixar Resultados (ZIP)", buf.getvalue(), "Resultados_V23.3.zip", "application/zip")
         st.dataframe(df_res)
         
     except Exception as e:
