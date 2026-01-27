@@ -7,14 +7,12 @@ import copy
 import re
 
 # --- CONFIGURAÇÃO ---
-st.set_page_config(page_title="Motor Alocação IFSC v22.1 (Clean)", layout="wide")
-st.title("🧩 Motor de Alocação IFSC - Arquitetura Limpa (V22.1)")
+st.set_page_config(page_title="Motor Alocação IFSC v22.2 (Fix)", layout="wide")
+st.title("🧩 Motor de Alocação IFSC - V22.2 (Correção EAD)")
 st.markdown("""
-**Lógica V22 (Corrigida):**
-1.  **Blocos Sólidos:** Alocação contínua da Semana 1 ao fim.
-2.  **Idiomas Virtuais:** UCs 'sem sala' não consomem espaço físico.
-3.  **Sala Base:** Definição automática de sala teórica por turma.
-4.  **Prioridade:** Labs > Teóricas > Virtuais.
+**Correções V22.2:**
+1.  **Fix Bug 'dia':** Corrigido erro técnico na alocação de UCs EAD.
+2.  **Lógica Sólida:** Mantém a alocação contínua e prioridade de Labs.
 """)
 
 # --- CONSTANTES ---
@@ -82,7 +80,7 @@ class MotorAlocacao:
                     b_ini = int(regra.iloc[0]['Bloqueio_Semana_Inicio'] or 0)
                     b_fim = int(regra.iloc[0]['Bloqueio_Semana_Fim'] or 0)
                     if b_ini > 0 and b_fim > 0:
-                        # Se houver sobreposição com o bloqueio (CORRIGIDO AQUI)
+                        # Se houver sobreposição com o bloqueio
                         if not (sem_fim < b_ini or sem_ini > b_fim): return True
         except: pass
         return False
@@ -144,7 +142,7 @@ class MotorAlocacao:
         # Distribui salas (Round Robin simples por enquanto)
         idx = 0
         for t in turmas_com_sala:
-            if idx < len(SALAS_TEORICAS): # CORRIGIDO AQUI
+            if idx < len(SALAS_TEORICAS):
                 self.sala_base[t] = SALAS_TEORICAS[idx]
                 idx += 1
             else:
@@ -170,7 +168,8 @@ class MotorAlocacao:
         if "EAD" in espacos_str or "100% EAD" in str(item.get('Regra_Especial', '')).upper():
             return (True, item['Carga_Horaria_Total'], {
                 "rec": [str(item['ID_Turma'])], "sem_ini": 1, "sem_fim": 20, 
-                "sala": "EAD", "obs": "EAD"
+                "sala": "EAD", "obs": "EAD", 
+                "dia": "EAD", "is_ead": True # CORREÇÃO AQUI: Adicionado chaves obrigatórias
             })
             
         eh_sem_sala = "SEM SALA" in espacos_str
@@ -276,13 +275,13 @@ class MotorAlocacao:
             sucesso, ch, config = self.alocar_item(item)
             
             if sucesso:
-                if config.get('is_split'):
-                    # Reserva Dia 1
-                    self.reservar(config['rec'], config['dias_split'][0], item['Turno'], config['sem_ini'], config['sem_fim'])
-                    # Reserva Dia 2
-                    self.reservar(config['rec'], config['dias_split'][1], item['Turno'], config['sem_ini'], config['sem_fim'])
-                else:
-                    self.reservar(config['rec'], config['dia'], item['Turno'], config['sem_ini'], config['sem_fim'])
+                # CORREÇÃO AQUI: Só reserva se não for EAD
+                if not config.get('is_ead'):
+                    if config.get('is_split'):
+                        self.reservar(config['rec'], config['dias_split'][0], item['Turno'], config['sem_ini'], config['sem_fim'])
+                        self.reservar(config['rec'], config['dias_split'][1], item['Turno'], config['sem_ini'], config['sem_fim'])
+                    else:
+                        self.reservar(config['rec'], config['dia'], item['Turno'], config['sem_ini'], config['sem_fim'])
                 
                 status = "✅ Alocado"
                 if "Virtual" in config['sala']: status += " (Sem Sala/Virtual)"
@@ -311,7 +310,7 @@ st.sidebar.download_button("📥 Baixar Modelo", gerar_template(), "modelo.xlsx"
 st.sidebar.markdown("---")
 up = st.sidebar.file_uploader("Upload Planilha", type=['xlsx'])
 
-if up and st.button("🚀 Rodar Otimizador V22.1"):
+if up and st.button("🚀 Rodar Otimizador V22.2"):
     try:
         df_dem = pd.read_excel(up, sheet_name='Demandas')
         try: df_doc = pd.read_excel(up, sheet_name='Docentes')
@@ -336,7 +335,7 @@ if up and st.button("🚀 Rodar Otimizador V22.1"):
                 z.writestr("04_Agenda_Docentes.csv", converter_csv(pd.DataFrame(rows)))
                 z.writestr("03_Ocupacao_Espacos.csv", converter_csv(df_res[['Dia', 'Turno', 'Espacos', 'ID_Turma', 'Semana_Inicio', 'Semana_Fim']]))
 
-        st.download_button("📦 Baixar Resultados (ZIP)", buf.getvalue(), "Resultados_V22.1.zip", "application/zip")
+        st.download_button("📦 Baixar Resultados (ZIP)", buf.getvalue(), "Resultados_V22.2.zip", "application/zip")
         st.dataframe(df_res)
         
     except Exception as e:
