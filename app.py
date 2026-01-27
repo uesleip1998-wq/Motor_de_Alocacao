@@ -9,13 +9,12 @@ import time
 import random
 
 # --- CONFIGURAÇÃO ---
-st.set_page_config(page_title="Motor Alocação IFSC v23.1 (Time-Boxed)", layout="wide")
-st.title("🧩 Motor de Alocação IFSC - V23.1 (Otimizado)")
+st.set_page_config(page_title="Motor Alocação IFSC v23.2 (Fix Config)", layout="wide")
+st.title("🧩 Motor de Alocação IFSC - V23.2 (Correção Config)")
 st.markdown("""
-**Lógica V23.1:**
-1.  **Time-Boxing:** Limite de execução de 5 minutos para evitar timeout.
-2.  **Heurística:** Prioriza Labs e Blocos Grandes.
-3.  **Fail-Fast:** Pula UCs impossíveis para salvar o resto da grade.
+**Correções V23.2:**
+1.  **Fix Erro 'config':** Tratamento correto de itens EAD na validação.
+2.  **Time-Boxing:** Mantido limite de 5 min.
 """)
 
 # --- CONSTANTES ---
@@ -129,32 +128,28 @@ class MotorAlocacao:
 
     def preparar_demandas(self):
         lista = self.otimizar_dados_entrada()
-        # Ordenação Otimizada
         def peso(item):
             esp = str(item.get('Espacos', '')).upper()
             ch = float(item.get('Carga_Horaria_Total', 0))
             if "SEM SALA" in esp or "EAD" in esp: return 1
             score = 10
-            if any(l.upper() in esp for l in map(str.upper, LABS_AB)): score += 100 # Prioridade Máxima Labs
-            score += ch # Prioridade para blocos grandes
+            if any(l.upper() in esp for l in map(str.upper, LABS_AB)): score += 100 
+            score += ch 
             return -score
         
         lista.sort(key=peso)
         return lista
 
     def resolver_grade(self, itens_para_alocar, grade_atual):
-        # Check de Tempo
         if time.time() - self.start_time > MAX_TIME_SEC:
-            # Salva o que conseguiu até agora se for melhor
             if len(grade_atual) > self.melhor_score:
                 self.melhor_score = len(grade_atual)
                 self.melhor_grade = copy.deepcopy(grade_atual)
-            return False, [] # Aborta profundidade
+            return False, []
 
         if not itens_para_alocar:
             return True, grade_atual
         
-        # Atualiza melhor grade parcial
         if len(grade_atual) > self.melhor_score:
             self.melhor_score = len(grade_atual)
             self.melhor_grade = copy.deepcopy(grade_atual)
@@ -162,11 +157,11 @@ class MotorAlocacao:
         item = itens_para_alocar[0]
         restante = itens_para_alocar[1:]
         
-        # Bypass EAD
         espacos_str = str(item.get('Espacos', '')).upper()
         if "EAD" in espacos_str or "100% EAD" in str(item.get('Regra_Especial', '')).upper():
             nova_grade = copy.deepcopy(grade_atual)
-            nova_grade.append(item | {"Alocacao": {"dia": "EAD", "sala": "EAD", "sem_ini": 1, "sem_fim": 20, "status": "✅ Alocado (EAD)"}})
+            # Item EAD não tem 'config', mas tem 'is_ead'
+            nova_grade.append(item | {"Alocacao": {"dia": "EAD", "sala": "EAD", "sem_ini": 1, "sem_fim": 20, "status": "✅ Alocado (EAD)", "is_ead": True}})
             return self.resolver_grade(restante, nova_grade)
 
         eh_sem_sala = "SEM SALA" in espacos_str
@@ -191,8 +186,7 @@ class MotorAlocacao:
         if item.get('Dia_Travado'): dias_teste = [item['Dia_Travado']]
         eh_curso_sem_sexta = any(c in str(item['ID_Turma']).upper() for c in CURSOS_SEM_SEXTA)
 
-        # Otimização: Reduz espaço de busca (apenas inícios estratégicos)
-        inicios_estrategicos = [1, 11, 6, 16] # Inícios de bimestre
+        inicios_estrategicos = [1, 11, 6, 16] 
         
         for dia in dias_teste:
             if dia == 'Sexta-Feira' and eh_curso_sem_sexta: continue
@@ -218,7 +212,6 @@ class MotorAlocacao:
                             "recursos": recursos_necessarios, "ch": ch_total
                         })
         
-        # Tenta os movimentos
         for mov in movimentos:
             if self.movimento_valido(mov, item, grade_atual):
                 nova_grade = copy.deepcopy(grade_atual)
@@ -240,9 +233,6 @@ class MotorAlocacao:
                 sucesso, grade_final = self.resolver_grade(restante, nova_grade)
                 if sucesso: return True, grade_final
         
-        # Se falhou tudo, mas o tempo ainda não acabou:
-        # Pula este item (Fail-Fast) e tenta alocar o resto
-        # Isso garante que 1 UC problemática não trave a grade toda
         self.erros.append(f"Falha Parcial: Não foi possível alocar {item['ID_Turma']} - {item['Nome_UC']}")
         return self.resolver_grade(restante, grade_atual)
 
@@ -259,6 +249,10 @@ class MotorAlocacao:
             slots_teste.append((mov['dias'][1], mov['sem_ini'], mov['sem_fim']))
 
         for alocada in grade:
+            # CORREÇÃO AQUI: Se for EAD, ignora na validação física
+            if alocada['Alocacao'].get('is_ead'): continue
+            
+            # Se não é EAD, tem 'config'
             cfg = alocada['Alocacao']['config']
             turno_aloc = alocada['Turno']
             if turno_item != turno_aloc: continue 
@@ -297,7 +291,6 @@ class MotorAlocacao:
         
         sucesso, grade_resolvida = self.resolver_grade(fila, [])
         
-        # Se acabou o tempo ou falhou parcial, usa a melhor grade encontrada
         if not grade_resolvida and self.melhor_grade:
             grade_resolvida = self.melhor_grade
             self.erros.append("Alerta: Solução Parcial (Tempo Esgotado ou Conflitos)")
@@ -312,7 +305,6 @@ class MotorAlocacao:
                 "Status": alo['status']
             })
             
-        # Adiciona os não alocados à lista final para visibilidade
         alocados_ids = [f"{i['ID_Turma']}-{i['UC']}" for i in res]
         for item in fila:
             uid = f"{item['ID_Turma']}-{item['Nome_UC']}"
@@ -330,7 +322,7 @@ st.sidebar.download_button("📥 Baixar Modelo", gerar_template(), "modelo.xlsx"
 st.sidebar.markdown("---")
 up = st.sidebar.file_uploader("Upload Planilha", type=['xlsx'])
 
-if up and st.button("🚀 Rodar Otimizador V23.1"):
+if up and st.button("🚀 Rodar Otimizador V23.2"):
     try:
         df_dem = pd.read_excel(up, sheet_name='Demandas')
         try: df_doc = pd.read_excel(up, sheet_name='Docentes')
@@ -351,7 +343,7 @@ if up and st.button("🚀 Rodar Otimizador V23.1"):
             z.writestr("01_Grade_Geral.csv", converter_csv(df_res))
             z.writestr("05_Dados_Brutos.json", df_res.to_json(orient='records', indent=4))
         
-        st.download_button("📦 Baixar Resultados (ZIP)", buf.getvalue(), "Resultados_V23.1.zip", "application/zip")
+        st.download_button("📦 Baixar Resultados (ZIP)", buf.getvalue(), "Resultados_V23.2.zip", "application/zip")
         st.dataframe(df_res)
         
     except Exception as e:
