@@ -7,10 +7,10 @@ import copy
 import re
 
 # --- CONFIGURAÇÃO ---
-st.set_page_config(page_title="Motor Alocação IFSC v22.0 (Clean)", layout="wide")
-st.title("🧩 Motor de Alocação IFSC - Arquitetura Limpa (V22)")
+st.set_page_config(page_title="Motor Alocação IFSC v22.1 (Clean)", layout="wide")
+st.title("🧩 Motor de Alocação IFSC - Arquitetura Limpa (V22.1)")
 st.markdown("""
-**Lógica V22:**
+**Lógica V22 (Corrigida):**
 1.  **Blocos Sólidos:** Alocação contínua da Semana 1 ao fim.
 2.  **Idiomas Virtuais:** UCs 'sem sala' não consomem espaço físico.
 3.  **Sala Base:** Definição automática de sala teórica por turma.
@@ -82,8 +82,8 @@ class MotorAlocacao:
                     b_ini = int(regra.iloc[0]['Bloqueio_Semana_Inicio'] or 0)
                     b_fim = int(regra.iloc[0]['Bloqueio_Semana_Fim'] or 0)
                     if b_ini > 0 and b_fim > 0:
-                        # Se houver sobreposição com o bloqueio
-                        if not (sem_fim &lt; b_ini or sem_ini > b_fim): return True
+                        # Se houver sobreposição com o bloqueio (CORRIGIDO AQUI)
+                        if not (sem_fim < b_ini or sem_ini > b_fim): return True
         except: pass
         return False
 
@@ -142,10 +142,9 @@ class MotorAlocacao:
                 turmas_com_sala.append(t)
         
         # Distribui salas (Round Robin simples por enquanto)
-        # Idealmente, separar por turno, mas vamos simplificar: Sala única global por turma
         idx = 0
         for t in turmas_com_sala:
-            if idx &lt; len(SALAS_TEORICAS):
+            if idx < len(SALAS_TEORICAS): # CORRIGIDO AQUI
                 self.sala_base[t] = SALAS_TEORICAS[idx]
                 idx += 1
             else:
@@ -183,28 +182,20 @@ class MotorAlocacao:
         # 3. Definição de Recursos Físicos
         recursos_fisicos = []
         if not eh_sem_sala:
-            # Se tem Lab explícito, usa. Se não, usa Sala Base.
             tem_lab = False
             for lab in LABS_AB:
                 if lab.upper() in espacos_str:
-                    recursos_fisicos.append(lab) # Usa o nome exato do Lab
+                    recursos_fisicos.append(lab) 
                     tem_lab = True
-            
-            # Se não é só Lab (ou seja, precisa de teórica ou é híbrido), adiciona Sala Base
-            # Na V22, simplificamos: Se tem Lab, o Lab é a sala. Se não tem, usa Sala Base.
-            # Mas o usuário disse: "UCs que usam laboratório vou indicar o laboratório".
-            # E "Aplicação designa sala base".
-            # Vamos assumir: Se a planilha diz SÓ Lab, usa Só Lab. Se diz Lab + Sala, usa ambos.
-            # Se não diz nada específico, usa Sala Base.
             
             if not tem_lab:
                 sala = self.sala_base.get(item['ID_Turma'])
                 if sala: recursos_fisicos.append(sala)
-            elif "SALA" in espacos_str: # Se pediu Lab E Sala
+            elif "SALA" in espacos_str: 
                  sala = self.sala_base.get(item['ID_Turma'])
                  if sala: recursos_fisicos.append(sala)
 
-        # 4. Busca de Horário (Backtracking Simplificado / Varredura)
+        # 4. Busca de Horário
         dias_possiveis = DIAS
         if item.get('Dia_Travado'): dias_possiveis = [item['Dia_Travado']]
         
@@ -215,7 +206,6 @@ class MotorAlocacao:
         for dia in dias_possiveis:
             if dia == 'Sexta-Feira' and eh_curso_sem_sexta: continue
             
-            # Tenta começar na semana 1, depois 2, etc.
             for inicio in range(1, 22 - duracao_semanas + 1):
                 fim = inicio + duracao_semanas - 1
                 
@@ -239,8 +229,6 @@ class MotorAlocacao:
                 })
                 
         # 5. Se falhar bloco contínuo, tenta Split (Tetris) - Apenas para 40h+
-        # Regra: Continuidade Pedagógica (Sem buracos)
-        # Opção A: Paralelo (Dia 1 Sem X-Y + Dia 2 Sem X-Y)
         if ch_total >= 40:
             metade_dur = int(duracao_semanas / 2)
             # Tenta achar 2 dias livres nas mesmas semanas
@@ -251,7 +239,6 @@ class MotorAlocacao:
                 dia1 = None
                 for d in dias_possiveis:
                     if d == 'Sexta-Feira' and eh_curso_sem_sexta: continue
-                    # Verifica tudo para Dia 1
                     docs = [d.strip() for d in str(item['Docentes']).split(',')]
                     if any(self.verificar_bloqueio_docente(d, d, item['Turno'], inicio, fim) for d in docs): continue
                     if self.verificar_conflito([str(item['ID_Turma'])] + recursos_fisicos, d, item['Turno'], inicio, fim): continue
@@ -308,7 +295,6 @@ class MotorAlocacao:
                     "Status": status
                 })
             else:
-                # Falha Real (Não deveria acontecer com a premissa de 400h, mas se acontecer, avisa)
                 self.erros.append(f"Falha ao alocar: {item['ID_Turma']} - {item['Nome_UC']}")
                 self.grade.append({
                     "ID_Turma": item['ID_Turma'], "UC": item['Nome_UC'], "CH_Total": item['Carga_Horaria_Total'],
@@ -325,7 +311,7 @@ st.sidebar.download_button("📥 Baixar Modelo", gerar_template(), "modelo.xlsx"
 st.sidebar.markdown("---")
 up = st.sidebar.file_uploader("Upload Planilha", type=['xlsx'])
 
-if up and st.button("🚀 Rodar Otimizador V22"):
+if up and st.button("🚀 Rodar Otimizador V22.1"):
     try:
         df_dem = pd.read_excel(up, sheet_name='Demandas')
         try: df_doc = pd.read_excel(up, sheet_name='Docentes')
@@ -350,7 +336,7 @@ if up and st.button("🚀 Rodar Otimizador V22"):
                 z.writestr("04_Agenda_Docentes.csv", converter_csv(pd.DataFrame(rows)))
                 z.writestr("03_Ocupacao_Espacos.csv", converter_csv(df_res[['Dia', 'Turno', 'Espacos', 'ID_Turma', 'Semana_Inicio', 'Semana_Fim']]))
 
-        st.download_button("📦 Baixar Resultados (ZIP)", buf.getvalue(), "Resultados_V22.zip", "application/zip")
+        st.download_button("📦 Baixar Resultados (ZIP)", buf.getvalue(), "Resultados_V22.1.zip", "application/zip")
         st.dataframe(df_res)
         
     except Exception as e:
