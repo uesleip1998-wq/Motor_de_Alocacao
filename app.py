@@ -5,17 +5,17 @@ from io import BytesIO
 import zipfile
 import copy
 import re
+import time
 import random
 
 # --- CONFIGURAÇÃO ---
-st.set_page_config(page_title="Motor Alocação IFSC v23.0 (Backtracking)", layout="wide")
-st.title("🧩 Motor de Alocação IFSC - V23 (Cascata Profunda)")
+st.set_page_config(page_title="Motor Alocação IFSC v23.1 (Time-Boxed)", layout="wide")
+st.title("🧩 Motor de Alocação IFSC - V23.1 (Otimizado)")
 st.markdown("""
-**Lógica V23:**
-1.  **Zoneamento Estático:** Sala Base fixa por turno (Turmas <= Salas).
-2.  **Reserva Dupla:** Lab + Sala Base sempre reservados juntos.
-3.  **Cascata Profunda:** Algoritmo de Backtracking para resolver conflitos de Docente/Lab.
-4.  **Regra 80%:** Redução automática de CH para UCs com regra 80%.
+**Lógica V23.1:**
+1.  **Time-Boxing:** Limite de execução de 5 minutos para evitar timeout.
+2.  **Heurística:** Prioriza Labs e Blocos Grandes.
+3.  **Fail-Fast:** Pula UCs impossíveis para salvar o resto da grade.
 """)
 
 # --- CONSTANTES ---
@@ -27,6 +27,7 @@ LABS_AB = [
 ]
 SALAS_TEORICAS = [f"Sala {i}" for i in range(1, 13) if i != 6]
 SALAS_BACKUP = ["Restaurante 1", "Lab. Informática 1", "Lab. Informática 2"]
+MAX_TIME_SEC = 300  # 5 Minutos
 
 # --- FUNÇÕES AUXILIARES ---
 def gerar_template():
@@ -50,7 +51,10 @@ class MotorAlocacao:
         self.restricoes = df_docentes.fillna("")
         self.grade_final = []
         self.erros = []
-        self.sala_base = {} # Mapa: (Turma, Turno) -> Sala
+        self.sala_base = {} 
+        self.start_time = 0
+        self.melhor_grade = []
+        self.melhor_score = 0
 
     def normalizar(self, texto):
         return str(texto).strip().upper()
@@ -99,18 +103,12 @@ class MotorAlocacao:
         return novas_demandas
 
     def definir_zoneamento(self):
-        """
-        Define Sala Base Única por Turma, respeitando o Turno.
-        Reinicia a contagem de salas para cada turno.
-        """
         turmas_por_turno = {'Matutino': [], 'Vespertino': [], 'Noturno': []}
         turmas_unicas = self.demandas['ID_Turma'].unique()
         
         for t in turmas_unicas:
-            # Pega o turno da primeira UC da turma (Turno Inviolável)
             turno = self.demandas[self.demandas['ID_Turma'] == t]['Turno'].iloc[0]
             if turno in turmas_por_turno:
-                # Ignora Idiomas (Sem Sala)
                 ucs = self.demandas[self.demandas['ID_Turma'] == t]
                 precisa_sala = False
                 for _, row in ucs.iterrows():
@@ -120,9 +118,7 @@ class MotorAlocacao:
                 if precisa_sala:
                     turmas_por_turno[turno].append(t)
         
-        # Distribui Salas
         todas_salas = SALAS_TEORICAS + SALAS_BACKUP
-        
         for turno, lista_turmas in turmas_por_turno.items():
             for i, turma in enumerate(lista_turmas):
                 if i < len(todas_salas):
@@ -133,29 +129,40 @@ class MotorAlocacao:
 
     def preparar_demandas(self):
         lista = self.otimizar_dados_entrada()
-        # Ordenação para Backtracking: Mais difíceis primeiro
-        # Labs > 80h > 40h > Sem Sala
+        # Ordenação Otimizada
         def peso(item):
             esp = str(item.get('Espacos', '')).upper()
             ch = float(item.get('Carga_Horaria_Total', 0))
             if "SEM SALA" in esp or "EAD" in esp: return 1
             score = 10
-            if any(l.upper() in esp for l in map(str.upper, LABS_AB)): score += 50
-            score += ch
-            return -score # Decrescente
+            if any(l.upper() in esp for l in map(str.upper, LABS_AB)): score += 100 # Prioridade Máxima Labs
+            score += ch # Prioridade para blocos grandes
+            return -score
         
         lista.sort(key=peso)
         return lista
 
-    # --- MOTOR DE BACKTRACKING ---
     def resolver_grade(self, itens_para_alocar, grade_atual):
+        # Check de Tempo
+        if time.time() - self.start_time > MAX_TIME_SEC:
+            # Salva o que conseguiu até agora se for melhor
+            if len(grade_atual) > self.melhor_score:
+                self.melhor_score = len(grade_atual)
+                self.melhor_grade = copy.deepcopy(grade_atual)
+            return False, [] # Aborta profundidade
+
         if not itens_para_alocar:
-            return True, grade_atual # Sucesso Total!
+            return True, grade_atual
         
+        # Atualiza melhor grade parcial
+        if len(grade_atual) > self.melhor_score:
+            self.melhor_score = len(grade_atual)
+            self.melhor_grade = copy.deepcopy(grade_atual)
+
         item = itens_para_alocar[0]
         restante = itens_para_alocar[1:]
         
-        # 1. Bypass EAD/Virtual
+        # Bypass EAD
         espacos_str = str(item.get('Espacos', '')).upper()
         if "EAD" in espacos_str or "100% EAD" in str(item.get('Regra_Especial', '')).upper():
             nova_grade = copy.deepcopy(grade_atual)
@@ -163,46 +170,33 @@ class MotorAlocacao:
             return self.resolver_grade(restante, nova_grade)
 
         eh_sem_sala = "SEM SALA" in espacos_str
-        
-        # 2. Definição de Recursos
         recursos_necessarios = []
         sala_visual = ""
         
         if not eh_sem_sala:
-            # Lab
             for lab in LABS_AB:
-                if lab.upper() in espacos_str:
-                    recursos_necessarios.append(lab)
-            
-            # Sala Base (Sombra Obrigatória)
+                if lab.upper() in espacos_str: recursos_necessarios.append(lab)
             sala_b = self.sala_base.get(item['ID_Turma'])
-            if sala_b:
-                recursos_necessarios.append(sala_b)
-            
+            if sala_b: recursos_necessarios.append(sala_b)
             sala_visual = " + ".join(recursos_necessarios)
         else:
             sala_visual = "Virtual/Sem Sala"
 
-        # 3. Cálculo de Tempo (Regra 80%)
         ch_total = float(item['Carga_Horaria_Total'] or 0)
-        ch_efetiva = ch_total
-        if "80%" in str(item.get('Regra_Especial', '')):
-            ch_efetiva = ch_total * 0.8
-        
+        ch_efetiva = ch_total * 0.8 if "80%" in str(item.get('Regra_Especial', '')) else ch_total
         duracao_semanas = int(np.ceil(ch_efetiva / 4))
         
-        # 4. Geração de Movimentos Possíveis (Dias x Semanas)
         movimentos = []
         dias_teste = DIAS
         if item.get('Dia_Travado'): dias_teste = [item['Dia_Travado']]
         eh_curso_sem_sexta = any(c in str(item['ID_Turma']).upper() for c in CURSOS_SEM_SEXTA)
 
-        # Opção A: Bloco Contínuo
+        # Otimização: Reduz espaço de busca (apenas inícios estratégicos)
+        inicios_estrategicos = [1, 11, 6, 16] # Inícios de bimestre
+        
         for dia in dias_teste:
             if dia == 'Sexta-Feira' and eh_curso_sem_sexta: continue
-            # Otimização: Tenta início 1, depois 11 (semestralidade), depois o resto
-            inicios = [1, 11] + list(range(2, 11)) + list(range(12, 22 - duracao_semanas + 1))
-            for ini in inicios:
+            for ini in inicios_estrategicos:
                 if ini > 22 - duracao_semanas + 1: continue
                 fim = ini + duracao_semanas - 1
                 movimentos.append({
@@ -210,10 +204,9 @@ class MotorAlocacao:
                     "recursos": recursos_necessarios, "ch": ch_total
                 })
 
-        # Opção B: Split (Tetris) - Apenas para 40h+
         if ch_total >= 40:
             metade = int(duracao_semanas / 2)
-            for ini in [1, 11]: # Otimização: Splits geralmente são semestrais
+            for ini in [1, 11]:
                 fim = ini + metade - 1
                 for d1 in dias_teste:
                     if d1 == 'Sexta-Feira' and eh_curso_sem_sexta: continue
@@ -225,28 +218,18 @@ class MotorAlocacao:
                             "recursos": recursos_necessarios, "ch": ch_total
                         })
         
-        # 5. Tentativa e Erro (Backtracking)
-        # Randomiza levemente para não viciar o algoritmo
-        # random.shuffle(movimentos) # Opcional: pode ajudar a sair de mínimos locais
-        
+        # Tenta os movimentos
         for mov in movimentos:
             if self.movimento_valido(mov, item, grade_atual):
                 nova_grade = copy.deepcopy(grade_atual)
-                
-                # Aplica o movimento
                 status_str = "✅ Alocado"
-                if mov['tipo'] == "SPLIT":
-                    status_str += " (Split)"
-                    sala_visual_final = sala_visual
-                else:
-                    sala_visual_final = sala_visual
-                
+                if mov['tipo'] == "SPLIT": status_str += " (Split)"
                 if eh_sem_sala: status_str += " (Sem Sala)"
 
                 nova_grade.append(item | {
                     "Alocacao": {
                         "dia": mov['dia'] if mov['tipo'] == "BLOCO" else f"{mov['dias'][0]} e {mov['dias'][1]}",
-                        "sala": sala_visual_final,
+                        "sala": sala_visual,
                         "sem_ini": mov['sem_ini'],
                         "sem_fim": mov['sem_fim'],
                         "status": status_str,
@@ -254,22 +237,20 @@ class MotorAlocacao:
                     }
                 })
                 
-                # Recursão
                 sucesso, grade_final = self.resolver_grade(restante, nova_grade)
-                if sucesso:
-                    return True, grade_final
-                
-                # Se falhou lá na frente, desfaz (o loop continua para o próximo movimento)
+                if sucesso: return True, grade_final
         
-        return False, [] # Falhou todas as tentativas para este item
+        # Se falhou tudo, mas o tempo ainda não acabou:
+        # Pula este item (Fail-Fast) e tenta alocar o resto
+        # Isso garante que 1 UC problemática não trave a grade toda
+        self.erros.append(f"Falha Parcial: Não foi possível alocar {item['ID_Turma']} - {item['Nome_UC']}")
+        return self.resolver_grade(restante, grade_atual)
 
     def movimento_valido(self, mov, item, grade):
-        # Verifica conflitos com a grade já alocada
         docs_item = [d.strip() for d in str(item['Docentes']).split(',')]
         turma_item = str(item['ID_Turma'])
         turno_item = item['Turno']
 
-        # Expande o movimento em slots de tempo (Dia, Semanas)
         slots_teste = []
         if mov['tipo'] == "BLOCO":
             slots_teste.append((mov['dia'], mov['sem_ini'], mov['sem_fim']))
@@ -278,17 +259,10 @@ class MotorAlocacao:
             slots_teste.append((mov['dias'][1], mov['sem_ini'], mov['sem_fim']))
 
         for alocada in grade:
-            # Dados da alocação existente
             cfg = alocada['Alocacao']['config']
             turno_aloc = alocada['Turno']
-            
-            # Se turnos diferentes, sem conflito (exceto Docente, que pode dar aula em turnos diferentes? 
-            # Assumimos que docente pode dar aula Mat e Not. O conflito é no MESMO turno/horário)
-            # Mas espere: Docente é pessoa física. Se ele dá aula de manhã e à noite, OK.
-            # Se ele dá aula na Turma A (Not) e Turma B (Not) no mesmo dia, CONFLITO.
             if turno_item != turno_aloc: continue 
 
-            # Expande slots da alocada
             slots_aloc = []
             if cfg['tipo'] == "BLOCO":
                 slots_aloc.append((cfg['dia'], cfg['sem_ini'], cfg['sem_fim']))
@@ -296,59 +270,59 @@ class MotorAlocacao:
                 slots_aloc.append((cfg['dias'][0], cfg['sem_ini'], cfg['sem_fim']))
                 slots_aloc.append((cfg['dias'][1], cfg['sem_ini'], cfg['sem_fim']))
 
-            # Verifica Colisão Temporal
             for d_t, ini_t, fim_t in slots_teste:
                 for d_a, ini_a, fim_a in slots_aloc:
-                    if d_t == d_a: # Mesmo Dia
-                        # Verifica Sobreposição de Semanas
+                    if d_t == d_a:
                         if not (fim_t < ini_a or ini_t > fim_a):
-                            # COLISÃO TEMPORAL DETECTADA!
-                            
-                            # 1. Conflito de Turma (Mesma turma em 2 lugares)
                             if turma_item == str(alocada['ID_Turma']): return False
-                            
-                            # 2. Conflito de Docente
                             docs_aloc = [d.strip() for d in str(alocada['Docentes']).split(',')]
                             if any(d in docs_aloc for d in docs_item): return False
-                            
-                            # 3. Conflito de Recurso Físico (Lab ou Sala Base)
-                            # Apenas se ambos usam recursos físicos (não virtuais)
                             rec_t = mov.get('recursos', [])
                             rec_a = cfg.get('recursos', [])
                             if rec_t and rec_a:
                                 if any(r in rec_a for r in rec_t): return False
         
-        # Verifica Bloqueios Administrativos do Docente
         for d_t, ini_t, fim_t in slots_teste:
              if any(self.verificar_bloqueio_docente(d, d_t, turno_item, ini_t, fim_t) for d in docs_item): return False
 
         return True
 
     def executar(self):
+        self.start_time = time.time()
         self.definir_zoneamento()
         fila = self.preparar_demandas()
         
-        # Limite de segurança para não travar o servidor (Heurística)
-        # Se a fila for muito grande, o backtracking puro explode.
-        # Vamos tentar resolver.
+        msg_area = st.empty()
+        msg_area.info("Iniciando alocação Time-Boxed (Máx 5 min)...")
         
-        with st.spinner("Resolvendo grade com Cascata Profunda... Isso pode levar alguns segundos."):
-            sucesso, grade_resolvida = self.resolver_grade(fila, [])
+        sucesso, grade_resolvida = self.resolver_grade(fila, [])
         
-        if sucesso:
-            # Formata para DataFrame
-            res = []
-            for item in grade_resolvida:
-                alo = item['Alocacao']
+        # Se acabou o tempo ou falhou parcial, usa a melhor grade encontrada
+        if not grade_resolvida and self.melhor_grade:
+            grade_resolvida = self.melhor_grade
+            self.erros.append("Alerta: Solução Parcial (Tempo Esgotado ou Conflitos)")
+
+        res = []
+        for item in grade_resolvida:
+            alo = item['Alocacao']
+            res.append({
+                "ID_Turma": item['ID_Turma'], "UC": item['Nome_UC'], "CH_Total": item['Carga_Horaria_Total'],
+                "Dia": alo['dia'], "Turno": item['Turno'], "Docentes": item['Docentes'],
+                "Espacos": alo['sala'], "Semana_Inicio": alo['sem_ini'], "Semana_Fim": alo['sem_fim'],
+                "Status": alo['status']
+            })
+            
+        # Adiciona os não alocados à lista final para visibilidade
+        alocados_ids = [f"{i['ID_Turma']}-{i['UC']}" for i in res]
+        for item in fila:
+            uid = f"{item['ID_Turma']}-{item['Nome_UC']}"
+            if uid not in alocados_ids:
                 res.append({
                     "ID_Turma": item['ID_Turma'], "UC": item['Nome_UC'], "CH_Total": item['Carga_Horaria_Total'],
-                    "Dia": alo['dia'], "Turno": item['Turno'], "Docentes": item['Docentes'],
-                    "Espacos": alo['sala'], "Semana_Inicio": alo['sem_ini'], "Semana_Fim": alo['sem_fim'],
-                    "Status": alo['status']
+                    "Status": "❌ Não Alocado (Timeout/Conflito)"
                 })
-            return pd.DataFrame(res), []
-        else:
-            return pd.DataFrame(), ["Não foi possível encontrar uma solução viável com as restrições atuais."]
+
+        return pd.DataFrame(res), self.erros
 
 # --- INTERFACE ---
 st.sidebar.header("📂 Área de Trabalho")
@@ -356,7 +330,7 @@ st.sidebar.download_button("📥 Baixar Modelo", gerar_template(), "modelo.xlsx"
 st.sidebar.markdown("---")
 up = st.sidebar.file_uploader("Upload Planilha", type=['xlsx'])
 
-if up and st.button("🚀 Rodar Otimizador V23"):
+if up and st.button("🚀 Rodar Otimizador V23.1"):
     try:
         df_dem = pd.read_excel(up, sheet_name='Demandas')
         try: df_doc = pd.read_excel(up, sheet_name='Docentes')
@@ -365,18 +339,20 @@ if up and st.button("🚀 Rodar Otimizador V23"):
         motor = MotorAlocacao(df_dem, df_doc)
         df_res, erros = motor.executar()
         
-        if not df_res.empty:
-            st.success("Alocação Finalizada com Sucesso!")
-            buf = BytesIO()
-            with zipfile.ZipFile(buf, "a", zipfile.ZIP_DEFLATED, False) as z:
-                z.writestr("01_Grade_Geral.csv", converter_csv(df_res))
-                z.writestr("05_Dados_Brutos.json", df_res.to_json(orient='records', indent=4))
-            
-            st.download_button("📦 Baixar Resultados (ZIP)", buf.getvalue(), "Resultados_V23.zip", "application/zip")
-            st.dataframe(df_res)
-        else:
-            st.error("Falha na Alocação: Conflito Irresolvível detectado.")
-            st.write(erros)
+        st.success("Processamento Finalizado!")
+        
+        if erros:
+            st.warning(f"{len(erros)} itens requerem atenção.")
+            with st.expander("Ver Detalhes dos Erros"):
+                st.write(erros)
+
+        buf = BytesIO()
+        with zipfile.ZipFile(buf, "a", zipfile.ZIP_DEFLATED, False) as z:
+            z.writestr("01_Grade_Geral.csv", converter_csv(df_res))
+            z.writestr("05_Dados_Brutos.json", df_res.to_json(orient='records', indent=4))
+        
+        st.download_button("📦 Baixar Resultados (ZIP)", buf.getvalue(), "Resultados_V23.1.zip", "application/zip")
+        st.dataframe(df_res)
         
     except Exception as e:
         st.error(f"Erro Crítico: {e}")
