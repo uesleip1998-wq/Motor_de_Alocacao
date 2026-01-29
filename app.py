@@ -9,12 +9,13 @@ import time
 import random
 
 # --- CONFIGURAÇÃO ---
-st.set_page_config(page_title="Motor Alocação IFSC v23.4 (Fix UC)", layout="wide")
-st.title("🧩 Motor de Alocação IFSC - V23.4 (Correção Key Error)")
+st.set_page_config(page_title="Motor Alocação IFSC v23.6 (Shuffle Solver)", layout="wide")
+st.title("🧩 Motor de Alocação IFSC - V23.6 (Encaixe Perfeito)")
 st.markdown("""
-**Correções V23.4:**
-1.  **Fix Erro 'UC':** Corrigida referência interna para 'Nome_UC'.
-2.  **Logs Detalhados:** Mantidos para diagnóstico.
+**Lógica V23.6:**
+1.  **Restrição Rígida:** Sexta-feira bloqueada para Guia/Eventos (320h máx).
+2.  **Motor de Persistência:** Se a alocação falhar, o sistema reordena as disciplinas e tenta de novo (várias vezes) para achar o encaixe perfeito.
+3.  **Foco em Saturação:** Turmas cheias têm prioridade total de processamento.
 """)
 
 # --- CONSTANTES ---
@@ -53,8 +54,7 @@ class MotorAlocacao:
         self.logs_detalhados = [] 
         self.sala_base = {} 
         self.start_time = 0
-        self.melhor_grade = []
-        self.melhor_score = 0
+        self.saturacao_turmas = {}
 
     def normalizar(self, texto):
         return str(texto).strip().upper()
@@ -64,15 +64,15 @@ class MotorAlocacao:
             regra = self.restricoes[self.restricoes['Nome_Docente'] == docente]
             if not regra.empty:
                 dias_indisp = str(regra.iloc[0]['Dias_Indisponiveis'])
-                if dia in dias_indisp and turno in dias_indisp: return f"Indisponibilidade Docente ({dia})"
+                if dia in dias_indisp and turno in dias_indisp: return True
                 
                 if 'Bloqueio_Semana_Inicio' in regra.columns:
                     b_ini = int(regra.iloc[0]['Bloqueio_Semana_Inicio'] or 0)
                     b_fim = int(regra.iloc[0]['Bloqueio_Semana_Fim'] or 0)
                     if b_ini > 0 and b_fim > 0:
-                        if not (sem_fim < b_ini or sem_ini > b_fim): return f"Bloqueio Semanal Docente ({b_ini}-{b_fim})"
+                        if not (sem_fim < b_ini or sem_ini > b_fim): return True
         except: pass
-        return None
+        return False
 
     def otimizar_dados_entrada(self):
         df = self.demandas.copy()
@@ -80,6 +80,10 @@ class MotorAlocacao:
             return re.sub(r'\s*\(parte \d+\)', '', str(nome), flags=re.IGNORECASE).strip()
         df['Nome_Base'] = df['Nome_UC'].apply(limpar_nome)
         
+        for turma in df['ID_Turma'].unique():
+            total = df[df['ID_Turma'] == turma]['Carga_Horaria_Total'].sum()
+            self.saturacao_turmas[turma] = total
+
         grupos = df.groupby(['ID_Turma', 'Nome_Base'])
         novas_demandas = []
         
@@ -128,41 +132,56 @@ class MotorAlocacao:
                     self.sala_base[turma] = "SEM SALA BASE"
 
     def preparar_demandas(self):
+        # Retorna dicionário {Turma: [Lista de UCs]} para processamento isolado
         lista = self.otimizar_dados_entrada()
-        def peso(item):
-            esp = str(item.get('Espacos', '')).upper()
-            ch = float(item.get('Carga_Horaria_Total', 0))
-            if "SEM SALA" in esp or "EAD" in esp: return 1
-            score = 10
-            if any(l.upper() in esp for l in map(str.upper, LABS_AB)): score += 100 
-            score += ch 
-            return -score
+        demandas_por_turma = {}
         
-        lista.sort(key=peso)
-        return lista
+        # Ordenação Global Inicial (Apenas para definir quem processa primeiro)
+        # Turmas mais cheias primeiro
+        def peso_turma(t_id):
+            saturacao = self.saturacao_turmas.get(t_id, 0)
+            eh_sem_sexta = any(c in str(t_id).upper() for c in CURSOS_SEM_SEXTA)
+            if eh_sem_sexta and saturacao >= 300: return -5000
+            if saturacao >= 380: return -5000
+            return -saturacao
 
-    def resolver_grade(self, itens_para_alocar, grade_atual):
-        if time.time() - self.start_time > MAX_TIME_SEC:
-            if len(grade_atual) > self.melhor_score:
-                self.melhor_score = len(grade_atual)
-                self.melhor_grade = copy.deepcopy(grade_atual)
-            return False, []
-
-        if not itens_para_alocar:
-            return True, grade_atual
+        turmas_ordenadas = sorted(list(set([i['ID_Turma'] for i in lista])), key=peso_turma)
         
-        if len(grade_atual) > self.melhor_score:
-            self.melhor_score = len(grade_atual)
-            self.melhor_grade = copy.deepcopy(grade_atual)
+        for item in lista:
+            t = item['ID_Turma']
+            if t not in demandas_por_turma: demandas_por_turma[t] = []
+            demandas_por_turma[t].append(item)
+            
+        return turmas_ordenadas, demandas_por_turma
 
-        item = itens_para_alocar[0]
-        restante = itens_para_alocar[1:]
+    def tentar_alocar_turma(self, ucs_da_turma, grade_global):
+        # Tenta alocar todas as UCs de uma turma específica
+        # Retorna (Sucesso, Grade_Atualizada_Com_A_Turma)
         
+        grade_local = copy.deepcopy(grade_global)
+        ucs_pendentes = ucs_da_turma.copy()
+        
+        # Ordenação interna padrão: Labs > Maiores > Menores
+        ucs_pendentes.sort(key=lambda x: (
+            -1000 if any(l.upper() in str(x.get('Espacos','')).upper() for l in map(str.upper, LABS_AB)) else 0,
+            -float(x.get('Carga_Horaria_Total', 0))
+        ))
+
+        for item in ucs_pendentes:
+            sucesso, nova_grade = self.alocar_item_individual(item, grade_local)
+            if sucesso:
+                grade_local = nova_grade
+            else:
+                return False, grade_global # Falhou a turma inteira nesta tentativa
+        
+        return True, grade_local
+
+    def alocar_item_individual(self, item, grade):
+        # Lógica de alocação de um único item (sem recursão profunda, apenas busca linear)
         espacos_str = str(item.get('Espacos', '')).upper()
         if "EAD" in espacos_str or "100% EAD" in str(item.get('Regra_Especial', '')).upper():
-            nova_grade = copy.deepcopy(grade_atual)
-            nova_grade.append(item | {"Alocacao": {"dia": "EAD", "sala": "EAD", "sem_ini": 1, "sem_fim": 20, "status": "✅ Alocado (EAD)", "is_ead": True}})
-            return self.resolver_grade(restante, nova_grade)
+            grade.append(item | {"Alocacao": {"dia": "EAD", "sala": "EAD", "sem_ini": 1, "sem_fim": 20, "status": "✅ Alocado (EAD)", "is_ead": True}})
+            return True, grade
 
         eh_sem_sala = "SEM SALA" in espacos_str
         recursos_necessarios = []
@@ -180,22 +199,21 @@ class MotorAlocacao:
         ch_total = float(item['Carga_Horaria_Total'] or 0)
         duracao_semanas = int(np.ceil(ch_total / 4))
         
-        movimentos = []
         dias_teste = DIAS
         if item.get('Dia_Travado'): dias_teste = [item['Dia_Travado']]
         eh_curso_sem_sexta = any(c in str(item['ID_Turma']).upper() for c in CURSOS_SEM_SEXTA)
 
-        inicios_estrategicos = [1, 11, 6, 16] 
-        
+        # Gera movimentos possíveis
+        movimentos = []
+        inicios = [1, 11, 6, 16] 
+        if ch_total <= 20: inicios = list(range(1, 22 - duracao_semanas + 1)) # Flexibilidade total para pequenos
+
         for dia in dias_teste:
             if dia == 'Sexta-Feira' and eh_curso_sem_sexta: continue
-            for ini in inicios_estrategicos:
+            for ini in inicios:
                 if ini > 22 - duracao_semanas + 1: continue
                 fim = ini + duracao_semanas - 1
-                movimentos.append({
-                    "tipo": "BLOCO", "dia": dia, "sem_ini": ini, "sem_fim": fim, 
-                    "recursos": recursos_necessarios, "ch": ch_total
-                })
+                movimentos.append({"tipo": "BLOCO", "dia": dia, "sem_ini": ini, "sem_fim": fim})
 
         if ch_total >= 40:
             metade = int(duracao_semanas / 2)
@@ -206,22 +224,16 @@ class MotorAlocacao:
                     for d2 in dias_teste:
                         if d1 == d2: continue
                         if d2 == 'Sexta-Feira' and eh_curso_sem_sexta: continue
-                        movimentos.append({
-                            "tipo": "SPLIT", "dias": [d1, d2], "sem_ini": ini, "sem_fim": fim,
-                            "recursos": recursos_necessarios, "ch": ch_total
-                        })
+                        movimentos.append({"tipo": "SPLIT", "dias": [d1, d2], "sem_ini": ini, "sem_fim": fim})
         
-        tentativas_falhas = []
-        
+        # Tenta encontrar um movimento válido
         for mov in movimentos:
-            valido, motivo = self.movimento_valido(mov, item, grade_atual)
-            if valido:
-                nova_grade = copy.deepcopy(grade_atual)
+            if self.movimento_valido(mov, item, grade):
                 status_str = "✅ Alocado"
                 if mov['tipo'] == "SPLIT": status_str += " (Split)"
                 if eh_sem_sala: status_str += " (Sem Sala)"
-
-                nova_grade.append(item | {
+                
+                grade.append(item | {
                     "Alocacao": {
                         "dia": mov['dia'] if mov['tipo'] == "BLOCO" else f"{mov['dias'][0]} e {mov['dias'][1]}",
                         "sala": sala_visual,
@@ -231,28 +243,16 @@ class MotorAlocacao:
                         "config": mov
                     }
                 })
-                
-                sucesso, grade_final = self.resolver_grade(restante, nova_grade)
-                if sucesso: return True, grade_final
-            else:
-                desc_mov = f"{mov['dia']} (Sem {mov['sem_ini']}-{mov['sem_fim']})" if mov['tipo'] == 'BLOCO' else f"Split {mov['dias']}"
-                tentativas_falhas.append(f"{desc_mov}: {motivo}")
+                return True, grade
         
-        self.erros.append(f"Falha: {item['ID_Turma']} - {item['Nome_UC']}")
-        self.logs_detalhados.append({
-            "ID_Turma": item['ID_Turma'],
-            "UC": item['Nome_UC'],
-            "Tentativas": len(movimentos),
-            "Detalhes_Falha": " | ".join(tentativas_falhas[:5]) + "..."
-        })
-        
-        return self.resolver_grade(restante, grade_atual)
+        return False, grade
 
     def movimento_valido(self, mov, item, grade):
         docs_item = [d.strip() for d in str(item['Docentes']).split(',')]
         turma_item = str(item['ID_Turma'])
         turno_item = item['Turno']
-
+        
+        # Verifica Bloqueio Docente
         slots_teste = []
         if mov['tipo'] == "BLOCO":
             slots_teste.append((mov['dia'], mov['sem_ini'], mov['sem_fim']))
@@ -262,12 +262,11 @@ class MotorAlocacao:
 
         for d_t, ini_t, fim_t in slots_teste:
             for d in docs_item:
-                motivo_doc = self.verificar_bloqueio_docente(d, d_t, turno_item, ini_t, fim_t)
-                if motivo_doc: return False, motivo_doc
+                if self.verificar_bloqueio_docente(d, d_t, turno_item, ini_t, fim_t): return False
 
+        # Verifica Conflitos com Grade
         for alocada in grade:
             if alocada['Alocacao'].get('is_ead'): continue
-            
             cfg = alocada['Alocacao']['config']
             turno_aloc = alocada['Turno']
             if turno_item != turno_aloc: continue 
@@ -283,38 +282,93 @@ class MotorAlocacao:
                 for d_a, ini_a, fim_a in slots_aloc:
                     if d_t == d_a:
                         if not (fim_t < ini_a or ini_t > fim_a):
-                            # CORREÇÃO AQUI: 'UC' -> 'Nome_UC'
-                            if turma_item == str(alocada['ID_Turma']): 
-                                return False, f"Turma Ocupada com {alocada['Nome_UC']}"
-                            
+                            if turma_item == str(alocada['ID_Turma']): return False
                             docs_aloc = [d.strip() for d in str(alocada['Docentes']).split(',')]
-                            if any(d in docs_aloc for d in docs_item): 
-                                return False, f"Docente Ocupado em {alocada['ID_Turma']}"
+                            if any(d in docs_aloc for d in docs_item): return False
                             
-                            rec_t = mov.get('recursos', [])
-                            rec_a = cfg.get('recursos', [])
-                            if rec_t and rec_a:
-                                if any(r in rec_a for r in rec_t): 
-                                    return False, f"Sala/Lab Ocupado por {alocada['ID_Turma']}"
+                            # Verifica Sala/Lab (Recursos Físicos)
+                            rec_t = []
+                            esp_t = str(item.get('Espacos', '')).upper()
+                            for lab in LABS_AB: 
+                                if lab.upper() in esp_t: rec_t.append(lab)
+                            sb_t = self.sala_base.get(item['ID_Turma'])
+                            if sb_t and "SEM SALA" not in esp_t: rec_t.append(sb_t)
 
-        return True, "OK"
+                            rec_a = []
+                            esp_a = str(alocada.get('Espacos', '')).upper()
+                            for lab in LABS_AB:
+                                if lab.upper() in esp_a: rec_a.append(lab)
+                            sb_a = self.sala_base.get(alocada['ID_Turma'])
+                            if sb_a and "SEM SALA" not in esp_a: rec_a.append(sb_a)
+
+                            if rec_t and rec_a:
+                                if any(r in rec_a for r in rec_t): return False
+        return True
 
     def executar(self):
         self.start_time = time.time()
         self.definir_zoneamento()
-        fila = self.preparar_demandas()
+        turmas_ord, demandas = self.preparar_demandas()
         
         msg_area = st.empty()
-        msg_area.info("Iniciando alocação V23.4...")
+        grade_global = []
         
-        sucesso, grade_resolvida = self.resolver_grade(fila, [])
+        total_turmas = len(turmas_ord)
         
-        if not grade_resolvida and self.melhor_grade:
-            grade_resolvida = self.melhor_grade
+        for idx, t_id in enumerate(turmas_ord):
+            ucs = demandas[t_id]
+            msg_area.info(f"Processando Turma {idx+1}/{total_turmas}: {t_id} (Tentando encaixe perfeito...)")
+            
+            # Tenta alocar a turma. Se falhar, embaralha e tenta de novo (até 50x)
+            sucesso_turma = False
+            melhor_resultado_turma = []
+            max_alocados = -1
+            
+            # 1. Tentativa Padrão (Ordenada)
+            sucesso, grade_temp = self.tentar_alocar_turma(ucs, grade_global)
+            if sucesso:
+                grade_global = grade_temp
+                sucesso_turma = True
+            else:
+                # 2. Modo Shuffle (Persistência)
+                # Se a turma está saturada (perto de 100%), tentamos várias permutações
+                tentativas = 50 if self.saturacao_turmas.get(t_id, 0) >= 300 else 5
+                
+                ucs_shuffle = ucs.copy()
+                for _ in range(tentativas):
+                    if time.time() - self.start_time > MAX_TIME_SEC: break
+                    
+                    random.shuffle(ucs_shuffle)
+                    suc, g_temp = self.tentar_alocar_turma(ucs_shuffle, grade_global)
+                    
+                    # Conta quantos foram alocados nessa tentativa
+                    # (A função retorna False se UM falhar, mas queremos saber qual foi o "menos pior")
+                    # Na verdade, minha função 'tentar_alocar_turma' retorna a grade global antiga se falhar.
+                    # Precisamos de uma função que retorne o parcial.
+                    # Simplificação: Se falhar o shuffle, não atualiza a global.
+                    
+                    if suc:
+                        grade_global = g_temp
+                        sucesso_turma = True
+                        break
+            
+            if not sucesso_turma:
+                # Se falhou tudo, aloca o que der (Modo Guloso Final)
+                # Isso vai gerar erro no relatório, mas garante o parcial
+                for item in ucs:
+                    suc_item, g_item = self.alocar_item_individual(item, grade_global)
+                    if suc_item:
+                        grade_global = g_item
+                    else:
+                        self.erros.append(f"Falha Irrecuperável: {item['ID_Turma']} - {item['Nome_UC']}")
 
+        # Formata Saída
         res = []
-        for item in grade_resolvida:
+        alocados_ids = []
+        for item in grade_global:
             alo = item['Alocacao']
+            uid = f"{item['ID_Turma']}-{item['Nome_UC']}"
+            alocados_ids.append(uid)
             res.append({
                 "ID_Turma": item['ID_Turma'], "UC": item['Nome_UC'], "CH_Total": item['Carga_Horaria_Total'],
                 "Dia": alo['dia'], "Turno": item['Turno'], "Docentes": item['Docentes'],
@@ -322,16 +376,17 @@ class MotorAlocacao:
                 "Status": alo['status']
             })
             
-        alocados_ids = [f"{i['ID_Turma']}-{i['UC']}" for i in res]
-        for item in fila:
-            uid = f"{item['ID_Turma']}-{item['Nome_UC']}"
-            if uid not in alocados_ids:
-                res.append({
-                    "ID_Turma": item['ID_Turma'], "UC": item['Nome_UC'], "CH_Total": item['Carga_Horaria_Total'],
-                    "Status": "❌ Não Alocado"
-                })
+        # Verifica o que faltou
+        for t_id in turmas_ord:
+            for item in demandas[t_id]:
+                uid = f"{item['ID_Turma']}-{item['Nome_UC']}"
+                if uid not in alocados_ids:
+                    res.append({
+                        "ID_Turma": item['ID_Turma'], "UC": item['Nome_UC'], "CH_Total": item['Carga_Horaria_Total'],
+                        "Status": "❌ Não Alocado (Sem espaço físico/temporal)"
+                    })
 
-        return pd.DataFrame(res), self.logs_detalhados
+        return pd.DataFrame(res), self.erros
 
 # --- INTERFACE ---
 st.sidebar.header("📂 Área de Trabalho")
@@ -339,7 +394,7 @@ st.sidebar.download_button("📥 Baixar Modelo", gerar_template(), "modelo.xlsx"
 st.sidebar.markdown("---")
 up = st.sidebar.file_uploader("Upload Planilha", type=['xlsx'])
 
-if up and st.button("🚀 Rodar Otimizador V23.4"):
+if up and st.button("🚀 Rodar Otimizador V23.6"):
     try:
         df_dem = pd.read_excel(up, sheet_name='Demandas')
         try: df_doc = pd.read_excel(up, sheet_name='Docentes')
@@ -352,16 +407,14 @@ if up and st.button("🚀 Rodar Otimizador V23.4"):
         
         if logs:
             st.warning(f"{len(logs)} itens não foram alocados.")
-            df_logs = pd.DataFrame(logs)
-            st.dataframe(df_logs)
+            st.write(logs)
 
         buf = BytesIO()
         with zipfile.ZipFile(buf, "a", zipfile.ZIP_DEFLATED, False) as z:
             z.writestr("01_Grade_Geral.csv", converter_csv(df_res))
-            z.writestr("02_Relatorio_Erros_Detalhados.csv", converter_csv(pd.DataFrame(logs)))
             z.writestr("05_Dados_Brutos.json", df_res.to_json(orient='records', indent=4))
         
-        st.download_button("📦 Baixar Resultados (ZIP)", buf.getvalue(), "Resultados_V23.4.zip", "application/zip")
+        st.download_button("📦 Baixar Resultados (ZIP)", buf.getvalue(), "Resultados_V23.6.zip", "application/zip")
         st.dataframe(df_res)
         
     except Exception as e:
